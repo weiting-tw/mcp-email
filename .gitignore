@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtualenv（不進版控，請各自重建）
+.venv/
+venv/
+env/
+
+# OMC / 工具狀態
+.omc/
+
+# 本機設定（含密碼，切勿提交）
+claude_desktop_config.json
+.env

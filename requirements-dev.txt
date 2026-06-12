@@ -1,0 +1,3 @@
+# 開發 / 測試用依賴（執行時不需要）
+-r requirements.txt
+aiosmtpd>=1.4    # test_e2e.py 用的 in-process 假 SMTP server
