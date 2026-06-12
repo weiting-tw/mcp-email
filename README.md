@@ -235,7 +235,10 @@ IMAP search syntax 常用：
 === 21/21 passed ===
 ```
 
-每次 push / PR 會由 GitHub Actions 在 Python 3.10–3.13 上自動跑（見 `.github/workflows/test.yml`）。
+另有 `test_mcp_stdio.py`：用真正的 MCP client 把 `server.py` 以 stdio 子行程啟動，
+跑完整 `initialize` → `list_tools` → 呼叫 tool 的 handshake，驗證能被任何 MCP host 載入。
+
+每次 push / PR 會由 GitHub Actions 在 Python 3.10–3.13 上自動跑兩支測試（見 `.github/workflows/test.yml`）。
 
 涵蓋三類情境：
 

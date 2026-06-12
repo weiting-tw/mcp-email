@@ -31,3 +31,6 @@ jobs:
 
       - name: Run end-to-end tests
         run: python test_e2e.py
+
+      - name: Run MCP stdio integration test
+        run: python test_mcp_stdio.py
