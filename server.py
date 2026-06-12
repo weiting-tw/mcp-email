@@ -37,6 +37,7 @@ import imaplib
 import logging
 import mimetypes
 import os
+import re
 import smtplib
 import ssl
 import time
@@ -401,22 +402,23 @@ def _imap_list_messages(folder: str, limit: int, search: str = "ALL") -> list[di
             status, fetched = conn.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)] FLAGS UID)")
             if status != "OK" or not fetched:
                 continue
+            # 從整個 fetch 回應彙整 metadata：UID / FLAGS 可能出現在 BODY literal「之後」的
+            # 獨立 bytes 元素裡（server 排序自由），所以把所有非 literal 片段都納入比對。
             header_blob = b""
-            flags_blob = b""
-            uid_val: Optional[str] = None
+            meta_parts: list[str] = []
             for piece in fetched:
                 if isinstance(piece, tuple):
-                    header_blob = piece[1]
-                    meta = piece[0].decode("utf-8", errors="replace")
-                    if "UID" in meta:
-                        # crude parse: "1 (UID 42 FLAGS (\\Seen) BODY[...]"
-                        import re
-                        m = re.search(r"UID\s+(\d+)", meta)
-                        if m:
-                            uid_val = m.group(1)
-                        m = re.search(r"FLAGS\s+\(([^)]*)\)", meta)
-                        if m:
-                            flags_blob = m.group(1).encode()
+                    # (含 literal 標記的回應字串, literal 資料)
+                    header_blob = piece[1] or header_blob
+                    if piece[0]:
+                        meta_parts.append(piece[0].decode("utf-8", errors="replace"))
+                elif isinstance(piece, (bytes, bytearray)):
+                    meta_parts.append(bytes(piece).decode("utf-8", errors="replace"))
+            meta = " ".join(meta_parts)
+            m = re.search(r"\bUID\s+(\d+)", meta)
+            uid_val: Optional[str] = m.group(1) if m else None
+            m = re.search(r"\bFLAGS\s+\(([^)]*)\)", meta)
+            flags_str = m.group(1).strip() if m else ""
             msg = email.message_from_bytes(header_blob)
             results.append({
                 "imap_id": mid.decode(),
@@ -425,7 +427,7 @@ def _imap_list_messages(folder: str, limit: int, search: str = "ALL") -> list[di
                 "to": _decode_header(msg.get("To", "")),
                 "subject": _decode_header(msg.get("Subject", "")),
                 "date": msg.get("Date", ""),
-                "flags": flags_blob.decode(errors="replace") if flags_blob else "",
+                "flags": flags_str,
             })
         return results
 
@@ -487,7 +489,6 @@ def _imap_list_folders() -> list[str]:
                 continue
             line = raw.decode("utf-8", errors="replace")
             # 格式 e.g.: (\HasNoChildren) "/" "INBOX"
-            import re
             m = re.search(r'"(?P<name>[^"]*)"\s*$', line)
             if m:
                 results.append(m.group("name"))
@@ -522,8 +523,25 @@ def _imap_delete(folder: str, uids: list[str]) -> dict[str, Any]:
                 ok += 1
             else:
                 fail.append(uid)
-        conn.expunge()
-        return {"deleted": ok, "failed": fail}
+        marked = [u for u in uids if u not in fail]
+        # 優先用 UID EXPUNGE（RFC 4315 UIDPLUS）：只清掉這次標記的 uid，
+        # 避免一般 EXPUNGE 把資料夾內其他「本來就標 \Deleted」的信一併清掉。
+        caps = getattr(conn, "capabilities", ()) or ()
+        method = "EXPUNGE"
+        if marked and "UIDPLUS" in caps:
+            try:
+                status, _ = conn.uid("EXPUNGE", ",".join(marked))
+                if status == "OK":
+                    method = "UID EXPUNGE"
+                else:
+                    conn.expunge()
+                    method = "EXPUNGE (fallback)"
+            except imaplib.IMAP4.error:
+                conn.expunge()
+                method = "EXPUNGE (fallback)"
+        else:
+            conn.expunge()
+        return {"deleted": ok, "failed": fail, "method": method}
 
 
 # ─── MCP server ───────────────────────────────────────────────────────────

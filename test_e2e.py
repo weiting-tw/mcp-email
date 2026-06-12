@@ -315,12 +315,21 @@ async def test_attachment_whitelist_allows_inside():
 
 # ─── IMAP 測試（用 FakeIMAP 取代真連線）─────────────────────────────────────
 class _FakeIMAPConn:
-    """模擬 imaplib.IMAP4 的最小子集，回傳 imaplib 風格的 tuple。"""
+    """模擬 imaplib.IMAP4 的最小子集，回傳 imaplib 風格的 tuple。
 
-    def __init__(self, store):
+    可參數化：
+    - capabilities：模擬 server 能力（含/不含 UIDPLUS）。
+    - meta_order："leading" 把 UID/FLAGS 放在 BODY literal 之前（多數 server）；
+                  "trailing" 放在 literal「之後」的獨立 bytes 元素裡（合法但較少見），
+                  用來驗證 parser 不依賴回應項目順序。
+    """
+
+    def __init__(self, store, capabilities=("IMAP4REV1", "UIDPLUS"), meta_order="leading"):
         self._store = store  # dict: uid(str) -> raw bytes
         self.flags = {uid: set() for uid in store}
         self.expunged = []
+        self.capabilities = capabilities
+        self.meta_order = meta_order
 
     def select(self, folder, readonly=True):
         return "OK", [str(len(self._store)).encode()]
@@ -338,15 +347,21 @@ class _FakeIMAPConn:
         # 只回 header 區塊給 list_messages
         header = raw.split(b"\r\n\r\n", 1)[0] + b"\r\n\r\n"
         flagstr = " ".join(self.flags[uid]) or "\\Seen"
-        meta = f'{mid} (UID {uid} FLAGS ({flagstr}) BODY[HEADER.FIELDS (FROM TO SUBJECT DATE)] {{{len(header)}}}'.encode()
-        return "OK", [(meta, header), b")"]
+        if self.meta_order == "trailing":
+            # UID / FLAGS 出現在 literal 之後的獨立元素
+            lead = f"{mid} (BODY[HEADER.FIELDS (FROM TO SUBJECT DATE)] {{{len(header)}}}".encode()
+            trail = f" FLAGS ({flagstr}) UID {uid})".encode()
+            return "OK", [(lead, header), trail]
+        lead = f'{mid} (UID {uid} FLAGS ({flagstr}) BODY[HEADER.FIELDS (FROM TO SUBJECT DATE)] {{{len(header)}}}'.encode()
+        return "OK", [(lead, header), b")"]
 
     def uid(self, command, uid, *rest):
-        if command == "fetch":
+        cmd = command.lower()
+        if cmd == "fetch":
             raw = self._store[uid]
             meta = f"1 (UID {uid} BODY[] {{{len(raw)}}}".encode()
             return "OK", [(meta, raw), b")"]
-        if command == "store":
+        if cmd == "store":
             action, flagspec = rest[0], rest[1]
             flag = flagspec.strip("()")
             if action.startswith("+"):
@@ -354,6 +369,12 @@ class _FakeIMAPConn:
             else:
                 self.flags.setdefault(uid, set()).discard(flag)
             return "OK", [b"stored"]
+        if cmd == "expunge":
+            # UID EXPUNGE：只清掉 uidset 內、且已標 \Deleted 的訊息
+            target = set(uid.split(","))
+            done = [u for u in target if "\\Deleted" in self.flags.get(u, set())]
+            self.expunged.extend(done)
+            return "OK", [str(len(done)).encode()]
         return "NO", [b"unknown"]
 
     def list(self):
@@ -375,11 +396,15 @@ class _FakeIMAPConn:
 
 
 class _FakeIMAPClient:
-    """取代 srv.IMAPClient 的 context manager。"""
+    """取代 srv.IMAPClient 的 context manager。
+
+    _factory 決定每次 with 建立的 fake conn（測試可換掉以模擬不同 server）。
+    """
     _last = None
+    _factory = staticmethod(lambda: _build_fake_store())
 
     def __init__(self, cfg):
-        self.conn = _build_fake_store()
+        self.conn = _FakeIMAPClient._factory()
         _FakeIMAPClient._last = self.conn
 
     def __enter__(self):
@@ -389,7 +414,7 @@ class _FakeIMAPClient:
         return False
 
 
-def _build_fake_store():
+def _build_fake_store(capabilities=("IMAP4REV1", "UIDPLUS"), meta_order="leading"):
     import email.policy
     from email.message import EmailMessage
 
@@ -415,16 +440,20 @@ def _build_fake_store():
         "101": m1.as_bytes(policy=email.policy.SMTP),
         "102": m2.as_bytes(policy=email.policy.SMTP),
     }
-    return _FakeIMAPConn(store)
+    return _FakeIMAPConn(store, capabilities=capabilities, meta_order=meta_order)
 
 
-async def _with_fake_imap(coro_fn):
+async def _with_fake_imap(coro_fn, factory=None):
     saved = srv.IMAPClient
+    saved_factory = _FakeIMAPClient._factory
     srv.IMAPClient = _FakeIMAPClient
+    if factory is not None:
+        _FakeIMAPClient._factory = staticmethod(factory)
     try:
         return await coro_fn()
     finally:
         srv.IMAPClient = saved
+        _FakeIMAPClient._factory = saved_factory
 
 
 async def test_imap_list_folders():
@@ -480,13 +509,37 @@ async def test_imap_mark():
 
 
 async def test_imap_delete():
+    """支援 UIDPLUS 的 server 應走 UID EXPUNGE，只清掉指定 uid。"""
     async def run():
         out = await srv._dispatch("email_delete", {"folder": "INBOX", "uids": ["102"]})
         assert out["deleted"] == 1
         assert out["failed"] == []
-        assert "102" in _FakeIMAPClient._last.expunged
+        assert out["method"] == "UID EXPUNGE", out
+        assert _FakeIMAPClient._last.expunged == ["102"], _FakeIMAPClient._last.expunged
     await _with_fake_imap(run)
     print("✅ test_imap_delete PASS")
+
+
+async def test_imap_delete_fallback_without_uidplus():
+    """server 不支援 UIDPLUS 時，應 fallback 到一般 EXPUNGE。"""
+    async def run():
+        out = await srv._dispatch("email_delete", {"folder": "INBOX", "uids": ["102"]})
+        assert out["deleted"] == 1
+        assert out["method"] == "EXPUNGE", out
+        assert "102" in _FakeIMAPClient._last.expunged
+    await _with_fake_imap(run, factory=lambda: _build_fake_store(capabilities=("IMAP4REV1",)))
+    print("✅ test_imap_delete_fallback_without_uidplus PASS")
+
+
+async def test_imap_list_messages_trailing_meta():
+    """FLAGS/UID 出現在 BODY literal 之後時，parser 仍能正確取出 uid。"""
+    async def run():
+        out = await srv._dispatch("email_list_messages", {"folder": "INBOX", "limit": 10})
+        uids = {m["uid"] for m in out["messages"]}
+        assert uids == {"101", "102"}, uids
+        assert all(m["uid"] is not None for m in out["messages"])
+    await _with_fake_imap(run, factory=lambda: _build_fake_store(meta_order="trailing"))
+    print("✅ test_imap_list_messages_trailing_meta PASS")
 
 
 async def test_imap_test_connection_ok():
@@ -520,6 +573,8 @@ async def main():
         test_imap_get_message,
         test_imap_mark,
         test_imap_delete,
+        test_imap_delete_fallback_without_uidplus,
+        test_imap_list_messages_trailing_meta,
         test_imap_test_connection_ok,
     ]
     passed = 0

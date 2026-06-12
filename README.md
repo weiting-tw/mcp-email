@@ -1,5 +1,7 @@
 # mcp-email — 本機 IMAP / SMTP 信箱 MCP server
 
+[![tests](https://github.com/weiting-tw/mcp-email/actions/workflows/test.yml/badge.svg)](https://github.com/weiting-tw/mcp-email/actions/workflows/test.yml)
+
 純 Python 單檔實作（`server.py`，~500 行），把任意支援 IMAP / SMTP 的標準信箱（Gmail / Outlook / Yahoo / iCloud / Zoho / 公司 Exchange / 自架 mail server …）包成 MCP tools 給 Claude / Claude Code / Cowork / 任何 MCP host 用。
 
 ## 能做什麼（8 個 tools）
@@ -230,8 +232,10 @@ IMAP search syntax 常用：
 ## 驗證測試結果
 
 ```
-=== 19/19 passed ===
+=== 21/21 passed ===
 ```
+
+每次 push / PR 會由 GitHub Actions 在 Python 3.10–3.13 上自動跑（見 `.github/workflows/test.yml`）。
 
 涵蓋三類情境：
 
@@ -250,13 +254,15 @@ IMAP search syntax 常用：
 
 **IMAP 讀信（FakeIMAP 取代真連線）**
 - `list_folders` / `list_messages`（UID 正確解析）/ `get_message`（text+html+附件 metadata）
-- `mark`（flag 真的寫入）/ `delete`（標 `\Deleted` 後 expunge）/ `test_connection`（IMAP NOOP）
+- `mark`（flag 真的寫入）/ `delete`（UID EXPUNGE，及不支援 UIDPLUS 時 fallback）/ `test_connection`（IMAP NOOP）
+- parser 健壯性：FLAGS/UID 出現在 BODY literal「之後」的回應排序也能正確解析
 
 ## 設計選擇 / 已知限制
 
 - **無 OAuth flow**：目前只支援帳密。Gmail / 365 OAuth2 比較複雜，要看後續是否真實需要再加。
 - **不維護長連線**：每次 IMAP 呼叫都重開連線。簡單可靠，效能上對「偶爾讀信」場景夠用；如果你要做「常駐 polling」可能要改長連線。
 - **IMAP search 直接傳給伺服器**：自由度高但要懂 RFC 3501 syntax；含空格的字串記得加雙引號（如 `FROM "alice@x.com"`）。
+- **刪信用 UID EXPUNGE**：`email_delete` 在 server 支援 UIDPLUS（RFC 4315）時只清掉你指定的 uid，不會誤刪資料夾內其他已標 `\Deleted` 的信；不支援時才 fallback 到一般 `EXPUNGE`（回傳的 `method` 欄位會標明用了哪種）。
 - **附件大小**：受 SMTP 伺服器限制（Gmail 25MB、Outlook 20MB、Exchange 視設定）。本工具不設上限，超過會直接 SMTP error。
 - **僅 stdio 協定**：給本機 Claude Desktop / Cowork 用。不支援 HTTP MCP server transport。
 - **single-process**：跑一個 user。多 tenant / 多帳號要靠 host 多開幾個 instance（每個給不同 env）。
