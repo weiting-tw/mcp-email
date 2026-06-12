@@ -86,6 +86,37 @@ python test_e2e.py
 
 不設環境變數也可以，啟動後第一次用之前先呼叫 `email_configure` 設定帳密（runtime 設定不會落地，重啟會清空）。
 
+### 用環境變數 + wrapper（推薦：設定檔零密碼）
+
+如果你的帳密放在 `~/.secrets`（會被 shell source 的機密檔），可以用附帶的 `run_server.sh`：
+它會先 `source ~/.secrets` 再啟動 server，所以連 GUI 啟動的 Claude Desktop 也吃得到 env、
+而設定檔裡完全不用寫密碼。設定改成：
+
+```json
+{
+  "mcpServers": {
+    "email": { "command": "/絕對路徑/mcp-email/run_server.sh" }
+  }
+}
+```
+
+**環境變數別名**：server 同時接受兩種命名，`~/.secrets` 不必改名 —
+
+| 標準名 | 也接受的別名 |
+|---|---|
+| `SMTP_HOST` / `IMAP_HOST` | `SMTP_SERVER` / `IMAP_SERVER` |
+| `SMTP_USER` / `IMAP_USER` | `SMTP_USERNAME` / `IMAP_USERNAME` |
+| `SMTP_PASS` / `IMAP_PASS` | `SMTP_PASSWORD` / `IMAP_PASSWORD` |
+
+**帳密只需設一組**：SMTP 與 IMAP 通常是同一個信箱帳號，所以帳密不必重複設 —
+- 用共用的 `EMAIL_USER` / `EMAIL_PASS`（或 `MAIL_*`），SMTP / IMAP 兩邊都吃；
+- 或只設一邊（例如只有 `IMAP_USERNAME` / `IMAP_PASSWORD`），另一邊會自動沿用同一組帳密。
+- 只有 `host` / `port` 因協定不同需各自設（如 `smtp.x.com:587` vs `imap.x.com:993`；自架常是同 host 不同 port）。
+
+**只設一個協定也可以**：IMAP 與 SMTP 功能完全獨立 —— 只設 IMAP 就能用全部讀信工具
+（`list_folders` / `list_messages` / `get_message` / `mark` / `delete`）；
+只設 SMTP 就能用 `email_send`。要兩種都用才需要兩邊的 host 都設。
+
 ## 常見信箱設定
 
 | 服務 | SMTP host | port | TLS | IMAP host | port | SSL | 備註 |

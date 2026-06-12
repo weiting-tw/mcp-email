@@ -20,6 +20,10 @@
 可選環境變數預設值（runtime 也能用 email_configure 覆蓋）：
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_USE_TLS
   IMAP_HOST, IMAP_PORT, IMAP_USER, IMAP_PASS, IMAP_USE_SSL
+  # 別名：HOST 可用 *_SERVER、USER 可用 *_USERNAME、PASS 可用 *_PASSWORD
+  #       例如 IMAP_SERVER / IMAP_USERNAME / IMAP_PASSWORD 也會被讀到
+  # 帳密只需設一次：SMTP / IMAP 同帳號時可用共用的 EMAIL_USER / EMAIL_PASS；
+  #       或只設一邊（如只有 IMAP_*），另一邊會自動沿用同一組帳密（host/port 仍各自設）
   EMAIL_FROM           # 寄件人預設 From（沒設就用 SMTP_USER）
   EMAIL_TIMEOUT_SEC    # 預設 30
   EMAIL_RETRY_MAX      # 預設 3
@@ -114,25 +118,53 @@ def _parse_dir_list(raw: Optional[str]) -> list[str]:
     return out
 
 
+def _env_any(*names: str, default: str = "") -> str:
+    """回傳第一個有設且非空的環境變數值（支援多種別名命名）。"""
+    for n in names:
+        v = os.environ.get(n)
+        if v is not None and v != "":
+            return v
+    return default
+
+
 def load_config_from_env() -> GlobalConfig:
     timeout = float(os.environ.get("EMAIL_TIMEOUT_SEC", "30"))
     retry = int(os.environ.get("EMAIL_RETRY_MAX", "3"))
+
+    # SMTP 與 IMAP 通常是同一組帳號密碼，因此帳密只需設一次：
+    #   1. 共用：EMAIL_USER / EMAIL_PASS（或 MAIL_*）兩邊都吃
+    #   2. 個別：SMTP_* / IMAP_*（含 *_USERNAME / *_PASSWORD 別名）會覆蓋共用值
+    #   3. 跨協定 fallback：只設了一邊（例如只有 IMAP_*）時，另一邊自動沿用同一組帳密
+    shared_user = _env_any("EMAIL_USER", "EMAIL_USERNAME", "MAIL_USER", "MAIL_USERNAME")
+    shared_pass = _env_any("EMAIL_PASS", "EMAIL_PASSWORD", "MAIL_PASS", "MAIL_PASSWORD")
+    smtp_user = _env_any("SMTP_USER", "SMTP_USERNAME", default=shared_user)
+    smtp_pass = _env_any("SMTP_PASS", "SMTP_PASSWORD", default=shared_pass)
+    imap_user = _env_any("IMAP_USER", "IMAP_USERNAME", default=shared_user)
+    imap_pass = _env_any("IMAP_PASS", "IMAP_PASSWORD", default=shared_pass)
+    # 跨協定沿用（同一信箱帳號）
+    smtp_user = smtp_user or imap_user
+    smtp_pass = smtp_pass or imap_pass
+    imap_user = imap_user or smtp_user
+    imap_pass = imap_pass or smtp_pass
+
     return GlobalConfig(
         smtp=SMTPConfig(
-            host=os.environ.get("SMTP_HOST", ""),
-            port=int(os.environ.get("SMTP_PORT", "587")),
-            username=os.environ.get("SMTP_USER", ""),
-            password=os.environ.get("SMTP_PASS", ""),
+            # host 同時接受 SMTP_HOST / SMTP_SERVER
+            host=_env_any("SMTP_HOST", "SMTP_SERVER"),
+            port=int(_env_any("SMTP_PORT", default="587")),
+            username=smtp_user,
+            password=smtp_pass,
             use_tls=_bool_env("SMTP_USE_TLS", True),
             use_ssl=_bool_env("SMTP_USE_SSL", False),
             verify_cert=_bool_env("SMTP_VERIFY_CERT", True),
             timeout=timeout,
         ),
         imap=IMAPConfig(
-            host=os.environ.get("IMAP_HOST", ""),
-            port=int(os.environ.get("IMAP_PORT", "993")),
-            username=os.environ.get("IMAP_USER", ""),
-            password=os.environ.get("IMAP_PASS", ""),
+            # host 同時接受 IMAP_HOST / IMAP_SERVER
+            host=_env_any("IMAP_HOST", "IMAP_SERVER"),
+            port=int(_env_any("IMAP_PORT", default="993")),
+            username=imap_user,
+            password=imap_pass,
             use_ssl=_bool_env("IMAP_USE_SSL", True),
             verify_cert=_bool_env("IMAP_VERIFY_CERT", True),
             timeout=timeout,

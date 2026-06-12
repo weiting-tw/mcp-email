@@ -183,6 +183,73 @@ async def test_configure_summary_no_password_leak():
     print("✅ test_configure_summary_no_password_leak PASS")
 
 
+async def test_env_alias_names():
+    """IMAP_SERVER/USERNAME/PASSWORD 等別名應被 load_config_from_env 正確讀到。"""
+    import os
+    keys = ["IMAP_SERVER", "IMAP_USERNAME", "IMAP_PASSWORD", "IMAP_PORT",
+            "SMTP_SERVER", "SMTP_USERNAME", "SMTP_PASSWORD"]
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        os.environ["IMAP_SERVER"] = "mail.example.com"
+        os.environ["IMAP_USERNAME"] = "alias_user"
+        os.environ["IMAP_PASSWORD"] = "alias_pass"
+        os.environ["IMAP_PORT"] = "993"
+        os.environ["SMTP_SERVER"] = "smtp.example.com"
+        os.environ["SMTP_USERNAME"] = "smtp_user"
+        os.environ["SMTP_PASSWORD"] = "smtp_pass"
+        cfg = srv.load_config_from_env()
+        assert cfg.imap.host == "mail.example.com", cfg.imap.host
+        assert cfg.imap.username == "alias_user"
+        assert cfg.imap.password == "alias_pass"
+        assert cfg.smtp.host == "smtp.example.com"
+        assert cfg.smtp.username == "smtp_user"
+        assert cfg.smtp.password == "smtp_pass"
+        print("✅ test_env_alias_names PASS")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+async def test_shared_credentials_one_set():
+    """只設一組帳密（IMAP_*）時，SMTP 應自動沿用同一組；EMAIL_* 共用也該兩邊都吃。"""
+    import os
+    keys = ["IMAP_USERNAME", "IMAP_PASSWORD", "IMAP_SERVER", "SMTP_SERVER",
+            "SMTP_USER", "SMTP_USERNAME", "SMTP_PASS", "SMTP_PASSWORD",
+            "EMAIL_USER", "EMAIL_PASS", "IMAP_USER", "IMAP_PASS", "MAIL_USER", "MAIL_PASS"]
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        # 只設 IMAP 帳密 + 兩邊 host（帳密刻意不重複設）
+        os.environ["IMAP_SERVER"] = "mail.example.com"
+        os.environ["SMTP_SERVER"] = "mail.example.com"
+        os.environ["IMAP_USERNAME"] = "wilber"
+        os.environ["IMAP_PASSWORD"] = "pw"
+        cfg = srv.load_config_from_env()
+        assert cfg.imap.username == "wilber" and cfg.imap.password == "pw"
+        assert cfg.smtp.username == "wilber", f"SMTP 沒沿用 IMAP 帳號：{cfg.smtp.username}"
+        assert cfg.smtp.password == "pw", "SMTP 沒沿用 IMAP 密碼"
+
+        # 改用共用 EMAIL_* 一次設定，兩邊都該吃到
+        for k in ("IMAP_USERNAME", "IMAP_PASSWORD"):
+            os.environ.pop(k, None)
+        os.environ["EMAIL_USER"] = "shared@example.com"
+        os.environ["EMAIL_PASS"] = "shared_pw"
+        cfg = srv.load_config_from_env()
+        assert cfg.imap.username == "shared@example.com" and cfg.smtp.username == "shared@example.com"
+        assert cfg.imap.password == "shared_pw" and cfg.smtp.password == "shared_pw"
+        print("✅ test_shared_credentials_one_set PASS")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 async def test_test_connection_smtp_ok():
     controller, _ = _start_smtpd(8029)
     try:
@@ -557,6 +624,8 @@ async def main():
         test_attachments_file_and_base64,
         test_retry_on_failure,
         test_configure_summary_no_password_leak,
+        test_env_alias_names,
+        test_shared_credentials_one_set,
         test_test_connection_smtp_ok,
         # 錯誤路徑
         test_send_no_sender_error,
