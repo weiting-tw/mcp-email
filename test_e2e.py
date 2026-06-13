@@ -445,12 +445,16 @@ class _FakeIMAPConn:
             self.expunged.extend(done)
             return "OK", [str(len(done)).encode()]
         if cmd == "move":
+            if uid not in self._store:
+                return "NO", [b"no such uid"]
             dest = rest[0]
             self.moved.append((uid, dest))
             self._store.pop(uid, None)
             self.flags.pop(uid, None)
             return "OK", [b"moved"]
         if cmd == "copy":
+            if uid not in self._store:
+                return "NO", [b"no such uid"]
             dest = rest[0]
             self.moved.append((uid, dest))
             return "OK", [b"copied"]
@@ -788,6 +792,91 @@ async def test_apply_rules_exact_and_match_mode_all():
     print("✅ test_apply_rules_exact_and_match_mode_all PASS")
 
 
+async def test_apply_rules_execute_mark():
+    """執行 mark 動作：flag 應真的寫入。"""
+    async def run():
+        out = await srv._dispatch("email_apply_rules", {
+            "folder": "INBOX", "dry_run": False,
+            "rules": [{"name": "flag-bob", "from_contains": "bob",
+                       "action": {"mark": "\\Flagged", "add": True}}],
+        })
+        assert out["executed"]["marked"] == 1, out
+        assert "\\Flagged" in _FakeIMAPClient._last.flags.get("102", set())
+    conn = _build_fake_store()
+    await _with_fake_imap(run, factory=lambda: conn)
+    print("✅ test_apply_rules_execute_mark PASS")
+
+
+async def test_apply_rules_execute_delete():
+    """執行 delete 動作：應標 \\Deleted 並 expunge。"""
+    async def run():
+        out = await srv._dispatch("email_apply_rules", {
+            "folder": "INBOX", "dry_run": False,
+            "rules": [{"name": "del-bob", "from_contains": "bob", "action": {"delete": True}}],
+        })
+        assert out["executed"]["deleted"] == 1, out
+        assert "102" in _FakeIMAPClient._last.expunged
+    conn = _build_fake_store()
+    await _with_fake_imap(run, factory=lambda: conn)
+    print("✅ test_apply_rules_execute_delete PASS")
+
+
+async def test_apply_rules_all_execute_precedence():
+    """match_mode=all 執行：同一封同時命中 move 與 delete 規則 → move 優先，不刪。"""
+    async def run():
+        await srv._dispatch("email_create_folder", {"folder": "Archive"})
+        out = await srv._dispatch("email_apply_rules", {
+            "folder": "INBOX", "dry_run": False, "match_mode": "all",
+            "rules": [
+                {"name": "mv", "from_contains": "alice", "action": {"move_to": "Archive"}},
+                {"name": "del", "subject_contains_all": ["測試主旨"], "action": {"delete": True}},
+            ],
+        })
+        assert out["executed"]["moved"] == 1, out
+        assert out["executed"]["deleted"] == 0, out  # move 優先，不該刪
+        assert any(uid == "101" for uid, _ in _FakeIMAPClient._last.moved)
+    conn = _build_fake_store(capabilities=("IMAP4REV1", "MOVE", "UIDPLUS"))
+    await _with_fake_imap(run, factory=lambda: conn)
+    print("✅ test_apply_rules_all_execute_precedence PASS")
+
+
+async def test_apply_rules_subject_contains_any():
+    async def run():
+        out = await srv._dispatch("email_apply_rules", {
+            "folder": "INBOX", "dry_run": True,
+            "rules": [{"name": "any", "subject_contains_any": ["不存在", "測試主旨"],
+                       "action": {"delete": True}}],
+        })
+        assert out["matched"] == 1 and out["preview"][0]["uid"] == "101", out
+    await _with_fake_imap(run)
+    print("✅ test_apply_rules_subject_contains_any PASS")
+
+
+async def test_move_partial_failure():
+    """部分 uid 不存在 → 進 failed 清單，不影響其他。"""
+    async def run():
+        await srv._dispatch("email_create_folder", {"folder": "Archive"})
+        out = await srv._dispatch("email_move_messages", {
+            "source_folder": "INBOX", "uids": ["101", "999"], "destination_folder": "Archive",
+        })
+        assert out["moved"] == 1 and out["failed"] == ["999"], out
+    conn = _build_fake_store(capabilities=("IMAP4REV1", "UIDPLUS"))
+    await _with_fake_imap(run, factory=lambda: conn)
+    print("✅ test_move_partial_failure PASS")
+
+
+async def test_create_folder_chinese():
+    """中文資料夾名稱：建立後存在性檢查（modified UTF-7）應一致。"""
+    async def run():
+        out = await srv._dispatch("email_create_folder", {"folder": "測試資料夾"})
+        assert out["created"] is True, out
+        out2 = await srv._dispatch("email_create_folder", {"folder": "測試資料夾"})
+        assert out2["already_exists"] is True, out2
+    conn = _build_fake_store()
+    await _with_fake_imap(run, factory=lambda: conn)
+    print("✅ test_create_folder_chinese PASS")
+
+
 async def main():
     tests = [
         test_simple_text,
@@ -826,6 +915,12 @@ async def main():
         test_apply_rules_empty_rule_no_match,
         test_apply_rules_regex_and_case_sensitive,
         test_apply_rules_exact_and_match_mode_all,
+        test_apply_rules_execute_mark,
+        test_apply_rules_execute_delete,
+        test_apply_rules_all_execute_precedence,
+        test_apply_rules_subject_contains_any,
+        test_move_partial_failure,
+        test_create_folder_chinese,
     ]
     passed = 0
     for t in tests:
