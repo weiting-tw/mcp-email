@@ -1,6 +1,6 @@
 """MCP stdio 整合煙霧測試。
 
-真的用 MCP client 把 server.py 以 stdio 子行程啟動，跑完整 protocol handshake：
+真的用 MCP client 把 mcp_email 以 stdio 子行程啟動，跑完整 protocol handshake：
   initialize -> list_tools -> 呼叫幾個不需網路的 tool。
 驗證這個 server 能被任何 MCP host（Claude Desktop / Code / Cowork）正常載入。
 
@@ -17,7 +17,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 HERE = Path(__file__).resolve().parent
-SERVER = str(HERE / "server.py")
+SERVER = str(HERE / "mcp_email.py")
 
 
 async def main() -> int:

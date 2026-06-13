@@ -4,6 +4,10 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# 打包產物
+build/
+dist/
+
 # Virtualenv（不進版控，請各自重建）
 .venv/
 venv/

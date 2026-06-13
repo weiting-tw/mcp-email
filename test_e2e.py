@@ -1,5 +1,5 @@
 """
-端對端測試：起一個本機 aiosmtpd 假 SMTP，呼叫 server.py 的 email_send 真寄信，驗收件人 / 內容 / 附件正確。
+端對端測試：起一個本機 aiosmtpd 假 SMTP，呼叫 mcp_email 的 email_send 真寄信，驗收件人 / 內容 / 附件正確。
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from aiosmtpd.controller import Controller
-import server as srv
+import mcp_email as srv
 
 
 class CaptureHandler:

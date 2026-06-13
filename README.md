@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/weiting-tw/mcp-email/actions/workflows/test.yml/badge.svg)](https://github.com/weiting-tw/mcp-email/actions/workflows/test.yml)
 
-純 Python 單檔實作（`server.py`，~500 行），把任意支援 IMAP / SMTP 的標準信箱（Gmail / Outlook / Yahoo / iCloud / Zoho / 公司 Exchange / 自架 mail server …）包成 MCP tools 給 Claude / Claude Code / Cowork / 任何 MCP host 用。
+純 Python 單模組實作（`mcp_email.py`），把任意支援 IMAP / SMTP 的標準信箱（Gmail / Outlook / Yahoo / iCloud / Zoho / 公司 Exchange / 自架 mail server …）包成 MCP tools 給 Claude / Claude Code / Cowork / 任何 MCP host 用。
 
 ## 能做什麼（8 個 tools）
 
@@ -26,6 +26,39 @@
 - ⚡ 高效能 ✅（timeout 可調、SMTP send 失敗 exponential backoff 重試）
 
 ## 安裝
+
+### 最快：uvx / pip（從 PyPI）
+
+已發佈到 PyPI，用 [uv](https://docs.astral.sh/uv/) 免手動建環境，首次執行自動抓套件：
+
+```bash
+uvx mcp-email          # 直接跑（uv 會自動安裝到隔離環境）
+# 或
+pipx install mcp-email
+pip install mcp-email   # 裝進現有環境，提供 `mcp-email` 指令
+```
+
+MCP host 設定（Claude Desktop / Code / Cursor / Cline … 通用），帳密走 env：
+
+```json
+{
+  "mcpServers": {
+    "email": {
+      "command": "uvx",
+      "args": ["mcp-email"],
+      "env": {
+        "IMAP_SERVER": "imap.gmail.com", "IMAP_PORT": "993",
+        "SMTP_SERVER": "smtp.gmail.com", "SMTP_PORT": "465", "SMTP_USE_SSL": "true",
+        "EMAIL_USER": "you@gmail.com", "EMAIL_PASS": "<app password>"
+      }
+    }
+  }
+}
+```
+
+> Claude Code 使用者：repo 內附 `.mcp.json`，用 `claude` 開這個資料夾會自動提示啟用。
+
+### 從原始碼（開發 / 自己改）
 
 建議用獨立的 virtualenv，避免污染系統 Python（也不要把 `.venv/` 提交到 git）：
 
@@ -61,7 +94,7 @@ python test_e2e.py
   "mcpServers": {
     "email": {
       "command": "python3",
-      "args": ["/Users/weiting/Documents/workspace/mcp-email/server.py"],
+      "args": ["/Users/weiting/Documents/workspace/mcp-email/mcp_email.py"],
       "env": {
         "SMTP_HOST": "smtp.gmail.com",
         "SMTP_PORT": "587",
@@ -266,7 +299,7 @@ IMAP search syntax 常用：
 === 21/21 passed ===
 ```
 
-另有 `test_mcp_stdio.py`：用真正的 MCP client 把 `server.py` 以 stdio 子行程啟動，
+另有 `test_mcp_stdio.py`：用真正的 MCP client 把 `mcp_email.py` 以 stdio 子行程啟動，
 跑完整 `initialize` → `list_tools` → 呼叫 tool 的 handshake，驗證能被任何 MCP host 載入。
 
 每次 push / PR 會由 GitHub Actions 在 Python 3.10–3.13 上自動跑兩支測試（見 `.github/workflows/test.yml`）。

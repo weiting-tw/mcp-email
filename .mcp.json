@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "email": {
+      "command": "uvx",
+      "args": ["mcp-email"],
+      "env": {
+        "_comment": "帳密請改用真實值，或刪掉這個 env 區塊改用 ~/.secrets / runtime email_configure。SMTP/IMAP 同帳號時 EMAIL_USER/EMAIL_PASS 設一次即可。",
+        "IMAP_SERVER": "imap.example.com",
+        "IMAP_PORT": "993",
+        "SMTP_SERVER": "smtp.example.com",
+        "SMTP_PORT": "465",
+        "SMTP_USE_SSL": "true",
+        "EMAIL_USER": "you@example.com",
+        "EMAIL_PASS": "your-app-password"
+      }
+    }
+  }
+}

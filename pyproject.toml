@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-email"
+version = "0.1.0"
+description = "本地 IMAP/SMTP 信箱 MCP server — 把任意標準信箱（Gmail/Outlook/自架…）包成 MCP tools"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Weiting-tw" }]
+keywords = ["mcp", "model-context-protocol", "email", "imap", "smtp", "claude"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Developers",
+    "Topic :: Communications :: Email",
+    "Operating System :: OS Independent",
+]
+dependencies = ["mcp[cli]>=1.0.0"]
+
+[project.optional-dependencies]
+dev = ["aiosmtpd>=1.4"]
+
+[project.scripts]
+mcp-email = "mcp_email:cli"
+
+[project.urls]
+Homepage = "https://github.com/weiting-tw/mcp-email"
+Repository = "https://github.com/weiting-tw/mcp-email"
+Issues = "https://github.com/weiting-tw/mcp-email/issues"
+
+[tool.setuptools]
+py-modules = ["mcp_email"]

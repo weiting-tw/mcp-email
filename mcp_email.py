@@ -11,7 +11,7 @@
   ⚡ 高效能：可調 timeout + 自動 retry（exponential backoff）
   📬 IMAP 讀信：list folders / list messages / get message / search / mark / delete
 
-啟動：python server.py
+啟動：python -m mcp_email（或安裝後直接 `mcp-email`）
 協定：stdio (MCP standard)
 
 依賴：
@@ -930,5 +930,10 @@ async def main() -> None:
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """console_scripts / `python -m mcp_email` 的同步進入點。"""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()
