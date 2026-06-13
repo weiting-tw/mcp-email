@@ -465,8 +465,19 @@ def _utf7_decode(name: Any) -> str:
     return "".join(out)
 
 
+def _imap_mailbox(name: str) -> str:
+    """把資料夾名稱轉成可安全傳給 IMAP 的 quoted-string（UTF-7 編碼 + 加引號 + 跳脫）。
+
+    imaplib 不會自動為含空格的 mailbox 名稱加引號（如 'BizForm Testing' 會被當兩個參數），
+    所以一律包成 quoted string，並跳脫 \\ 與 "。
+    """
+    enc = _utf7_encode(name)
+    escaped = enc.replace("\\", "\\\\").replace('"', '\\"')
+    return '"' + escaped + '"'
+
+
 def _imap_select(conn: imaplib.IMAP4, folder: str, readonly: bool = True) -> int:
-    status, data = conn.select(_utf7_encode(folder), readonly=readonly)
+    status, data = conn.select(_imap_mailbox(folder), readonly=readonly)
     if status != "OK":
         raise RuntimeError(f"select folder {folder} 失敗：{data!r}")
     count = int(data[0]) if data and data[0] else 0
@@ -629,7 +640,8 @@ def _imap_delete(folder: str, uids: list[str]) -> dict[str, Any]:
 def _imap_folder_exists(conn: imaplib.IMAP4, folder: str) -> bool:
     """以 LIST 精確比對 folder 是否存在（folder 為純文字名稱）。"""
     enc = _utf7_encode(folder)
-    status, data = conn.list("", enc)
+    # reference 要用 quoted 空字串 '""'，傳真正的空字串 imaplib 會漏掉參數
+    status, data = conn.list('""', _imap_mailbox(folder))
     if status != "OK":
         return False
     for raw in data or []:
@@ -644,10 +656,10 @@ def _imap_folder_exists(conn: imaplib.IMAP4, folder: str) -> bool:
 
 def _imap_create_folder(folder: str) -> dict[str, Any]:
     with IMAPClient(CONFIG.imap) as conn:
-        enc = _utf7_encode(folder)
+        mbox = _imap_mailbox(folder)
         if _imap_folder_exists(conn, folder):
             return {"folder": folder, "created": False, "already_exists": True}
-        status, data = conn.create(enc)
+        status, data = conn.create(mbox)
         if status != "OK":
             detail = (data[0].decode("utf-8", errors="replace") if data and data[0] else "").lower()
             if "exist" in detail:
@@ -655,7 +667,7 @@ def _imap_create_folder(folder: str) -> dict[str, Any]:
             raise RuntimeError(f"create folder {folder} 失敗：{data!r}")
         # best-effort 訂閱，讓 Webmail / 多數客戶端看得到
         try:
-            conn.subscribe(enc)
+            conn.subscribe(mbox)
         except Exception:
             pass
         return {"folder": folder, "created": True, "already_exists": False}
@@ -667,7 +679,7 @@ def _imap_move_messages(source: str, uids: list[str], dest: str) -> dict[str, An
         if not _imap_folder_exists(conn, dest):
             raise RuntimeError(f"目的地資料夾不存在：{dest}（請先呼叫 email_create_folder）")
         _imap_select(conn, source, readonly=False)
-        dest_enc = _utf7_encode(dest)
+        dest_enc = _imap_mailbox(dest)
         caps = getattr(conn, "capabilities", ()) or ()
         moved: list[str] = []
         failed: list[str] = []

@@ -381,6 +381,13 @@ async def test_attachment_whitelist_allows_inside():
 
 
 # ─── IMAP 測試（用 FakeIMAP 取代真連線）─────────────────────────────────────
+def _unq(s):
+    """模擬 server 端解開 IMAP quoted-string（去引號 + 反跳脫）。"""
+    if isinstance(s, str) and len(s) >= 2 and s[0] == '"' and s[-1] == '"':
+        return s[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return s
+
+
 class _FakeIMAPConn:
     """模擬 imaplib.IMAP4 的最小子集，回傳 imaplib 風格的 tuple。
 
@@ -447,26 +454,26 @@ class _FakeIMAPConn:
         if cmd == "move":
             if uid not in self._store:
                 return "NO", [b"no such uid"]
-            dest = rest[0]
-            self.moved.append((uid, dest))
+            self.moved.append((uid, _unq(rest[0])))
             self._store.pop(uid, None)
             self.flags.pop(uid, None)
             return "OK", [b"moved"]
         if cmd == "copy":
             if uid not in self._store:
                 return "NO", [b"no such uid"]
-            dest = rest[0]
-            self.moved.append((uid, dest))
+            self.moved.append((uid, _unq(rest[0])))
             return "OK", [b"copied"]
         return "NO", [b"unknown"]
 
     def list(self, directory=None, pattern=None):
         names = sorted(self.folders)
         if pattern is not None:  # 存在性查詢（精確比對 encoded 名稱）
-            names = [n for n in names if n == pattern]
+            pat = _unq(pattern)
+            names = [n for n in names if n == pat]
         return "OK", [f'(\\HasNoChildren) "/" "{n}"'.encode() for n in names]
 
     def create(self, name):
+        name = _unq(name)
         if name in self.folders:
             return "NO", [b"[ALREADYEXISTS] Mailbox already exists"]
         self.folders.add(name)
@@ -648,6 +655,16 @@ async def test_utf7_folder_name():
     for s in ["INBOX", "BizForm Testing", "測試機錯誤信", "a&b", "混合 mix"]:
         assert srv._utf7_decode(srv._utf7_encode(s)) == s, s
     print("✅ test_utf7_folder_name PASS")
+
+
+async def test_imap_mailbox_quoting():
+    """含空格 / 引號 / 中文的資料夾名稱都要正確包成 quoted-string（imaplib 不會自動加）。"""
+    assert srv._imap_mailbox("BizForm Testing") == '"BizForm Testing"'   # 空格需引號
+    # 中文：引號包住 UTF-7 編碼後的字串
+    assert srv._imap_mailbox("測試機錯誤信") == '"' + srv._utf7_encode("測試機錯誤信") + '"'
+    assert "&" in srv._imap_mailbox("測試機錯誤信")                       # 確實有編碼
+    assert srv._imap_mailbox('a"b\\c') == '"a\\"b\\\\c"'                 # 跳脫 " 與 \
+    print("✅ test_imap_mailbox_quoting PASS")
 
 
 # ─── 新 tools：create_folder / move_messages / apply_rules ─────────────────
@@ -907,6 +924,7 @@ async def main():
         test_imap_test_connection_ok,
         # 資料夾名稱編碼 + 新 tools
         test_utf7_folder_name,
+        test_imap_mailbox_quoting,
         test_create_folder,
         test_move_messages_uidplus_fallback,
         test_move_messages_uid_move,
