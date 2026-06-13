@@ -34,7 +34,7 @@ async def main() -> int:
             tools = await session.list_tools()
             names = [t.name for t in tools.tools]
             print(f"✅ list_tools — {len(names)} tools: {names}")
-            assert len(names) == 8, f"預期 8 個 tool，實際 {len(names)}"
+            assert len(names) == 11, f"預期 11 個 tool，實際 {len(names)}"
 
             # email_configure（不需網路）：驗證不回傳明文密碼
             r = await session.call_tool("email_configure", {

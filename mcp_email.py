@@ -10,6 +10,7 @@
   🔍 連線測試：email_test_connection 一鍵測 SMTP + IMAP
   ⚡ 高效能：可調 timeout + 自動 retry（exponential backoff）
   📬 IMAP 讀信：list folders / list messages / get message / search / mark / delete
+  🗂️ IMAP 整理：create folder（中文名 UTF-7）/ move messages（MOVE→COPY fallback）/ apply rules（dry_run）
 
 啟動：python -m mcp_email（或安裝後直接 `mcp-email`）
 協定：stdio (MCP standard)
@@ -413,8 +414,59 @@ def _decode_header(raw: str) -> str:
     return "".join(decoded)
 
 
+def _utf7_encode(name: str) -> str:
+    """純文字資料夾名稱 → IMAP modified UTF-7（RFC 3501 §5.1.3）。
+
+    例：'日本語' → '&ZeVnLIqe-'；ASCII（含空格）原樣保留；'&' → '&-'。
+    """
+    out: list[str] = []
+    i, n = 0, len(name)
+    while i < n:
+        ch = name[i]
+        if 0x20 <= ord(ch) <= 0x7e:
+            out.append("&-" if ch == "&" else ch)
+            i += 1
+        else:
+            j = i
+            while j < n and not (0x20 <= ord(name[j]) <= 0x7e):
+                j += 1
+            b64 = base64.b64encode(name[i:j].encode("utf-16-be")).decode("ascii")
+            out.append("&" + b64.rstrip("=").replace("/", ",") + "-")
+            i = j
+    return "".join(out)
+
+
+def _utf7_decode(name: Any) -> str:
+    """IMAP modified UTF-7 → 純文字資料夾名稱（_utf7_encode 的逆運算）。"""
+    if isinstance(name, (bytes, bytearray)):
+        name = bytes(name).decode("ascii", "replace")
+    out: list[str] = []
+    i, n = 0, len(name)
+    while i < n:
+        ch = name[i]
+        if ch == "&":
+            j = name.find("-", i)
+            if j == -1:
+                j = n
+            chunk = name[i + 1:j]
+            if chunk == "":
+                out.append("&")
+            else:
+                b64 = chunk.replace(",", "/")
+                b64 += "=" * ((-len(b64)) % 4)
+                try:
+                    out.append(base64.b64decode(b64).decode("utf-16-be"))
+                except Exception:
+                    out.append("&" + chunk + "-")
+            i = j + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def _imap_select(conn: imaplib.IMAP4, folder: str, readonly: bool = True) -> int:
-    status, data = conn.select(folder, readonly=readonly)
+    status, data = conn.select(_utf7_encode(folder), readonly=readonly)
     if status != "OK":
         raise RuntimeError(f"select folder {folder} 失敗：{data!r}")
     count = int(data[0]) if data and data[0] else 0
@@ -522,10 +574,8 @@ def _imap_list_folders() -> list[str]:
             line = raw.decode("utf-8", errors="replace")
             # 格式 e.g.: (\HasNoChildren) "/" "INBOX"
             m = re.search(r'"(?P<name>[^"]*)"\s*$', line)
-            if m:
-                results.append(m.group("name"))
-            else:
-                results.append(line)
+            # 解 modified UTF-7，回傳可讀的中文資料夾名稱
+            results.append(_utf7_decode(m.group("name")) if m else line)
         return results
 
 
@@ -574,6 +624,169 @@ def _imap_delete(folder: str, uids: list[str]) -> dict[str, Any]:
         else:
             conn.expunge()
         return {"deleted": ok, "failed": fail, "method": method}
+
+
+def _imap_folder_exists(conn: imaplib.IMAP4, folder: str) -> bool:
+    """以 LIST 精確比對 folder 是否存在（folder 為純文字名稱）。"""
+    enc = _utf7_encode(folder)
+    status, data = conn.list("", enc)
+    if status != "OK":
+        return False
+    for raw in data or []:
+        if not raw:
+            continue
+        line = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        m = re.search(r'"(?P<name>[^"]*)"\s*$', line)
+        if m and m.group("name") == enc:
+            return True
+    return False
+
+
+def _imap_create_folder(folder: str) -> dict[str, Any]:
+    with IMAPClient(CONFIG.imap) as conn:
+        enc = _utf7_encode(folder)
+        if _imap_folder_exists(conn, folder):
+            return {"folder": folder, "created": False, "already_exists": True}
+        status, data = conn.create(enc)
+        if status != "OK":
+            detail = (data[0].decode("utf-8", errors="replace") if data and data[0] else "").lower()
+            if "exist" in detail:
+                return {"folder": folder, "created": False, "already_exists": True}
+            raise RuntimeError(f"create folder {folder} 失敗：{data!r}")
+        # best-effort 訂閱，讓 Webmail / 多數客戶端看得到
+        try:
+            conn.subscribe(enc)
+        except Exception:
+            pass
+        return {"folder": folder, "created": True, "already_exists": False}
+
+
+def _imap_move_messages(source: str, uids: list[str], dest: str) -> dict[str, Any]:
+    with IMAPClient(CONFIG.imap) as conn:
+        # 目的地必須先存在（不自動建立，請先呼叫 email_create_folder）
+        if not _imap_folder_exists(conn, dest):
+            raise RuntimeError(f"目的地資料夾不存在：{dest}（請先呼叫 email_create_folder）")
+        _imap_select(conn, source, readonly=False)
+        dest_enc = _utf7_encode(dest)
+        caps = getattr(conn, "capabilities", ()) or ()
+        moved: list[str] = []
+        failed: list[str] = []
+
+        if "MOVE" in caps:
+            method = "UID MOVE"
+            for uid in uids:
+                status, _ = conn.uid("MOVE", uid, dest_enc)
+                (moved if status == "OK" else failed).append(uid)
+        else:
+            # fallback：UID COPY → 標 \Deleted → UID EXPUNGE（避免誤刪其他 \Deleted 信）
+            method = "COPY+EXPUNGE"
+            for uid in uids:
+                status, _ = conn.uid("COPY", uid, dest_enc)
+                if status != "OK":
+                    failed.append(uid)
+                    continue
+                conn.uid("STORE", uid, "+FLAGS.SILENT", "(\\Deleted)")
+                moved.append(uid)
+            if moved:
+                if "UIDPLUS" in caps:
+                    try:
+                        conn.uid("EXPUNGE", ",".join(moved))
+                    except imaplib.IMAP4.error:
+                        conn.expunge()
+                        method = "COPY+EXPUNGE (full)"
+                else:
+                    conn.expunge()
+                    method = "COPY+EXPUNGE (full)"
+        return {"moved": len(moved), "failed": failed, "method": method,
+                "source": source, "destination": dest}
+
+
+def _rule_matches(rule: dict[str, Any], frm_lower: str, subj_lower: str) -> bool:
+    """子字串 + 大小寫不敏感比對。空規則（無任何條件）一律不命中（安全）。"""
+    has_cond = False
+    fc = rule.get("from_contains")
+    if fc:
+        has_cond = True
+        if fc.lower() not in frm_lower:
+            return False
+    all_subs = rule.get("subject_contains_all") or []
+    if all_subs:
+        has_cond = True
+        if not all(s.lower() in subj_lower for s in all_subs):
+            return False
+    any_subs = rule.get("subject_contains_any") or []
+    if any_subs:
+        has_cond = True
+        if not any(s.lower() in subj_lower for s in any_subs):
+            return False
+    return has_cond
+
+
+def _imap_apply_rules(folder: str, limit: int, search: str,
+                      rules: list[dict[str, Any]], dry_run: bool) -> dict[str, Any]:
+    msgs = _imap_list_messages(folder, limit, search)
+    hits: list[dict[str, Any]] = []  # 每封命中的（first-match）
+    for m in msgs:
+        frm = (m.get("from") or "").lower()
+        subj = (m.get("subject") or "").lower()
+        for rule in rules:
+            if _rule_matches(rule, frm, subj):
+                hits.append({"uid": m.get("uid"), "rule": rule.get("name"),
+                             "from": m.get("from"), "subject": m.get("subject"),
+                             "action": rule.get("action") or {}})
+                break  # first-match-wins
+
+    by_rule: dict[str, int] = {}
+    for h in hits:
+        by_rule[h["rule"] or "?"] = by_rule.get(h["rule"] or "?", 0) + 1
+
+    summary = {
+        "folder": folder, "scanned": len(msgs), "matched": len(hits),
+        "by_rule": by_rule, "dry_run": dry_run,
+        "preview": [{"uid": h["uid"], "rule": h["rule"],
+                     "from": h["from"], "subject": h["subject"],
+                     "action": h["action"]} for h in hits[:10]],
+    }
+    if dry_run:
+        return summary
+
+    # 真正執行：依 action 分組
+    executed = {"moved": 0, "marked": 0, "deleted": 0, "failed": []}
+    moves: dict[str, list[str]] = {}   # dest -> uids
+    marks: list[tuple[str, str, bool]] = []  # (uid, flag, add)
+    deletes: list[str] = []
+    for h in hits:
+        uid, act = h["uid"], h["action"]
+        if not uid:
+            continue
+        if "move_to" in act:
+            moves.setdefault(act["move_to"], []).append(uid)
+        elif "delete" in act and act["delete"]:
+            deletes.append(uid)
+        elif "mark" in act:
+            marks.append((uid, act["mark"], act.get("add", True)))
+
+    for dest, uids in moves.items():
+        r = _imap_move_messages(folder, uids, dest)
+        executed["moved"] += r["moved"]
+        executed["failed"] += r["failed"]
+    if marks:
+        with IMAPClient(CONFIG.imap) as conn:
+            _imap_select(conn, folder, readonly=False)
+            for uid, flag, add in marks:
+                action = "+FLAGS.SILENT" if add else "-FLAGS.SILENT"
+                status, _ = conn.uid("store", uid, action, f"({flag})")
+                if status == "OK":
+                    executed["marked"] += 1
+                else:
+                    executed["failed"].append(uid)
+    if deletes:
+        r = _imap_delete(folder, deletes)
+        executed["deleted"] += r["deleted"]
+        executed["failed"] += r["failed"]
+
+    summary["executed"] = executed
+    return summary
 
 
 # ─── MCP server ───────────────────────────────────────────────────────────
@@ -758,6 +971,81 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="email_create_folder",
+            description=(
+                "建立 IMAP folder / mailbox（支援中文名稱，自動 modified UTF-7 編碼）。"
+                "已存在時不報錯，回傳 already_exists=true。"
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["folder"],
+                "properties": {
+                    "folder": {"type": "string", "description": "資料夾名稱，如 'BizForm Testing'"},
+                },
+            },
+        ),
+        Tool(
+            name="email_move_messages",
+            description=(
+                "把指定 UID 的信從 source_folder 搬到 destination_folder。"
+                "優先用 UID MOVE，server 不支援則 fallback 為 COPY + UID EXPUNGE。"
+                "目的地需先存在（請先呼叫 email_create_folder）。"
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["source_folder", "uids", "destination_folder"],
+                "properties": {
+                    "source_folder": {"type": "string"},
+                    "uids": {"type": "array", "items": {"type": "string"}},
+                    "destination_folder": {"type": "string"},
+                },
+            },
+        ),
+        Tool(
+            name="email_apply_rules",
+            description=(
+                "掃描 folder 後，依規則對信件做 move / mark / delete。"
+                "比對為子字串、大小寫不敏感、first-match-wins（一封信只套第一條命中的規則）。"
+                "強烈建議先 dry_run=true 預覽命中數與前幾封，確認無誤再執行。"
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["rules"],
+                "properties": {
+                    "folder": {"type": "string", "default": "INBOX"},
+                    "limit": {"type": "integer", "default": 200, "minimum": 1, "maximum": 2000},
+                    "search": {
+                        "type": "string",
+                        "default": "ALL",
+                        "description": "可選 IMAP search 先在 server 端縮小掃描範圍（大信箱建議用）",
+                    },
+                    "dry_run": {"type": "boolean", "default": True},
+                    "rules": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string"},
+                                "from_contains": {"type": "string"},
+                                "subject_contains_all": {"type": "array", "items": {"type": "string"}},
+                                "subject_contains_any": {"type": "array", "items": {"type": "string"}},
+                                "action": {
+                                    "type": "object",
+                                    "description": "{move_to: 資料夾} 或 {mark: '\\\\Seen', add: true} 或 {delete: true}",
+                                    "properties": {
+                                        "move_to": {"type": "string"},
+                                        "mark": {"type": "string"},
+                                        "add": {"type": "boolean"},
+                                        "delete": {"type": "boolean"},
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        ),
     ]
 
 
@@ -890,6 +1178,26 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
         folder = args.get("folder", "INBOX")
         uids = [str(u) for u in args["uids"]]
         return await asyncio.to_thread(_imap_delete, folder, uids)
+
+    if name == "email_create_folder":
+        folder = args["folder"]
+        return await asyncio.to_thread(_imap_create_folder, folder)
+
+    if name == "email_move_messages":
+        source = args["source_folder"]
+        dest = args["destination_folder"]
+        uids = [str(u) for u in args["uids"]]
+        return await asyncio.to_thread(_imap_move_messages, source, uids, dest)
+
+    if name == "email_apply_rules":
+        folder = args.get("folder", "INBOX")
+        limit = int(args.get("limit", 200))
+        search = args.get("search", "ALL")
+        dry_run = args.get("dry_run", True)
+        rules = args.get("rules") or []
+        if not rules:
+            raise ValueError("rules 不可為空")
+        return await asyncio.to_thread(_imap_apply_rules, folder, limit, search, rules, dry_run)
 
     raise ValueError(f"未知 tool: {name}")
 

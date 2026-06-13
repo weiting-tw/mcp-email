@@ -4,18 +4,21 @@
 
 純 Python 單模組實作（`mcp_email.py`），把任意支援 IMAP / SMTP 的標準信箱（Gmail / Outlook / Yahoo / iCloud / Zoho / 公司 Exchange / 自架 mail server …）包成 MCP tools 給 Claude / Claude Code / Cowork / 任何 MCP host 用。
 
-## 能做什麼（8 個 tools）
+## 能做什麼（11 個 tools）
 
 | Tool | 用途 |
 |---|---|
 | `email_configure` | Runtime 動態切換 SMTP / IMAP 帳密、port、TLS |
 | `email_test_connection` | 一鍵測 SMTP + IMAP 是否能登入 |
 | `email_send` | 寄信：HTML + 純文字、to/cc/bcc、檔案/Base64 附件、Reply-To、自訂 headers、retry |
-| `email_list_folders` | IMAP 列出所有 mailbox 名稱 |
+| `email_list_folders` | IMAP 列出所有 mailbox 名稱（中文名稱自動解碼） |
 | `email_list_messages` | 列出 folder 內訊息 header（支援 IMAP search syntax） |
 | `email_get_message` | 抓單封信完整內容（body text/html、附件 metadata、選擇是否標 SEEN） |
 | `email_mark` | 加/移除 IMAP flag（`\Seen` / `\Flagged` 等） |
-| `email_delete` | 標記 `\Deleted` 並 expunge |
+| `email_delete` | 標記 `\Deleted` 並 expunge（UID EXPUNGE） |
+| `email_create_folder` | 建立 folder（支援中文，自動 modified UTF-7；已存在不報錯） |
+| `email_move_messages` | 搬信：UID MOVE，server 不支援則 COPY + UID EXPUNGE fallback |
+| `email_apply_rules` | 規則整理：掃描後依條件 move/mark/delete，支援 `dry_run` 預覽 |
 
 對應使用者需求：
 - 📤 寄信 HTML + 純文字 ✅（multipart/alternative，純文字 fallback 自動）
