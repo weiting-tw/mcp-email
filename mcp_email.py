@@ -11,6 +11,7 @@
   ⚡ 高效能：可調 timeout + 自動 retry（exponential backoff）
   📬 IMAP 讀信：list folders / list messages / get message / search / mark / delete
   🗂️ IMAP 整理：create folder（中文名 UTF-7）/ move messages（MOVE→COPY fallback）/ apply rules（dry_run）
+  💾 規則持久化：save / list / disable / delete / run saved rules（存本機 rules.json，給排程用）
 
 啟動：python -m mcp_email（或安裝後直接 `mcp-email`）
 協定：stdio (MCP standard)
@@ -39,6 +40,7 @@ import email
 import email.message
 import email.policy
 import imaplib
+import json
 import logging
 import mimetypes
 import os
@@ -840,6 +842,115 @@ def _imap_apply_rules(folder: str, limit: int, search: str,
     return summary
 
 
+# ─── 規則持久化（save / list / disable / run）──────────────────────────────
+def _rules_file() -> Path:
+    """規則儲存位置。可用 MCP_EMAIL_RULES_FILE 覆寫；否則 XDG_CONFIG_HOME/mcp-email/rules.json。"""
+    override = os.environ.get("MCP_EMAIL_RULES_FILE")
+    if override:
+        return Path(override).expanduser()
+    cfg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(cfg) / "mcp-email" / "rules.json"
+
+
+def _load_rules() -> dict[str, Any]:
+    p = _rules_file()
+    if not p.is_file():
+        return {"version": 1, "rules": []}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {"version": 1, "rules": []}
+    if not isinstance(data, dict) or not isinstance(data.get("rules"), list):
+        return {"version": 1, "rules": []}
+    data.setdefault("version", 1)
+    return data
+
+
+def _save_rules(data: dict[str, Any]) -> None:
+    """atomic write：寫 temp 後 os.replace，避免多 process 並發寫壞檔。"""
+    p = _rules_file()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, p)
+
+
+def _rule_save(rule: dict[str, Any]) -> dict[str, Any]:
+    name = rule.get("name")
+    if not name:
+        raise ValueError("rule 必須有 name")
+    rule = {**rule}
+    rule.setdefault("enabled", True)
+    data = _load_rules()
+    rules = data["rules"]
+    for i, r in enumerate(rules):
+        if r.get("name") == name:
+            rules[i] = rule
+            break
+    else:
+        rules.append(rule)
+    _save_rules(data)
+    return {"saved": name, "enabled": rule["enabled"], "total": len(rules),
+            "path": str(_rules_file())}
+
+
+def _rule_list() -> dict[str, Any]:
+    data = _load_rules()
+    return {
+        "count": len(data["rules"]),
+        "path": str(_rules_file()),
+        "rules": [{
+            "name": r.get("name"), "enabled": r.get("enabled", True),
+            "folder": r.get("folder", "INBOX"), "match": r.get("match", "substring"),
+            "from_contains": r.get("from_contains"),
+            "subject_contains_all": r.get("subject_contains_all"),
+            "subject_contains_any": r.get("subject_contains_any"),
+            "action": r.get("action"),
+        } for r in data["rules"]],
+    }
+
+
+def _rule_set_enabled(name: str, enabled: bool) -> dict[str, Any]:
+    data = _load_rules()
+    for r in data["rules"]:
+        if r.get("name") == name:
+            r["enabled"] = enabled
+            _save_rules(data)
+            return {"name": name, "enabled": enabled}
+    raise ValueError(f"找不到規則：{name}")
+
+
+def _rule_delete(name: str) -> dict[str, Any]:
+    data = _load_rules()
+    before = len(data["rules"])
+    data["rules"] = [r for r in data["rules"] if r.get("name") != name]
+    if len(data["rules"]) == before:
+        raise ValueError(f"找不到規則：{name}")
+    _save_rules(data)
+    return {"deleted": name, "remaining": len(data["rules"])}
+
+
+def _run_saved_rules(rule_names: Optional[list[str]], dry_run: bool, limit: int,
+                     search: str, case_sensitive: bool, match_mode: str) -> dict[str, Any]:
+    data = _load_rules()
+    selected = [r for r in data["rules"] if r.get("enabled", True)]
+    if rule_names:
+        want = set(rule_names)
+        selected = [r for r in selected if r.get("name") in want]
+    if not selected:
+        return {"ran": 0, "dry_run": dry_run, "note": "沒有符合的啟用規則", "results": []}
+    # 依各規則的 folder 分組，逐 folder 套用
+    by_folder: dict[str, list[dict[str, Any]]] = {}
+    for r in selected:
+        by_folder.setdefault(r.get("folder", "INBOX"), []).append(r)
+    results = []
+    for folder, frs in by_folder.items():
+        results.append(_imap_apply_rules(folder, limit, search, frs, dry_run,
+                                          case_sensitive, match_mode))
+    return {"ran": len(selected), "dry_run": dry_run,
+            "rules": [r.get("name") for r in selected], "results": results}
+
+
 # ─── MCP server ───────────────────────────────────────────────────────────
 server = Server("mcp-email")
 
@@ -1111,6 +1222,79 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="email_save_rule",
+            description=(
+                "把一條整理規則存到本機（~/.config/mcp-email/rules.json，可用 MCP_EMAIL_RULES_FILE 覆寫）。"
+                "同名會覆蓋（upsert）。之後可用 email_run_saved_rules 重複執行。"
+                "規則格式同 email_apply_rules 的單條，外加 folder（預設 INBOX）與 enabled（預設 true）。"
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["rule"],
+                "properties": {
+                    "rule": {
+                        "type": "object",
+                        "required": ["name", "action"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "folder": {"type": "string", "default": "INBOX"},
+                            "enabled": {"type": "boolean", "default": True},
+                            "match": {"type": "string", "enum": ["substring", "regex", "exact"]},
+                            "from_contains": {"type": "string"},
+                            "subject_contains_all": {"type": "array", "items": {"type": "string"}},
+                            "subject_contains_any": {"type": "array", "items": {"type": "string"}},
+                            "action": {"type": "object"},
+                        },
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="email_list_rules",
+            description="列出本機已儲存的整理規則（含 enabled 狀態），方便檢查是否有危險規則。",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="email_disable_rule",
+            description="啟用 / 停用一條已儲存規則（不刪除，較安全）。",
+            inputSchema={
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "enabled": {"type": "boolean", "default": False, "description": "false=停用、true=重新啟用"},
+                },
+            },
+        ),
+        Tool(
+            name="email_delete_rule",
+            description="永久刪除一條已儲存規則。若只是暫時不跑，建議用 email_disable_rule。",
+            inputSchema={
+                "type": "object",
+                "required": ["name"],
+                "properties": {"name": {"type": "string"}},
+            },
+        ),
+        Tool(
+            name="email_run_saved_rules",
+            description=(
+                "執行已儲存的規則（給排程用）。不指定 rule_names 則跑所有 enabled 規則；"
+                "依各規則的 folder 分組套用。預設 dry_run=true（安全），cron 要真的執行請傳 false。"
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "rule_names": {"type": "array", "items": {"type": "string"},
+                                   "description": "只跑這些規則名稱；省略=全部 enabled"},
+                    "dry_run": {"type": "boolean", "default": True},
+                    "limit": {"type": "integer", "default": 500, "minimum": 1, "maximum": 5000},
+                    "search": {"type": "string", "default": "ALL"},
+                    "case_sensitive": {"type": "boolean", "default": False},
+                    "match_mode": {"type": "string", "enum": ["first", "all"], "default": "first"},
+                },
+            },
+        ),
     ]
 
 
@@ -1267,6 +1451,32 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
         return await asyncio.to_thread(
             _imap_apply_rules, folder, limit, search, rules, dry_run,
             case_sensitive, match_mode,
+        )
+
+    if name == "email_save_rule":
+        rule = args.get("rule")
+        if not isinstance(rule, dict):
+            raise ValueError("rule 必須是物件")
+        return _rule_save(rule)
+
+    if name == "email_list_rules":
+        return _rule_list()
+
+    if name == "email_disable_rule":
+        return _rule_set_enabled(args["name"], args.get("enabled", False))
+
+    if name == "email_delete_rule":
+        return _rule_delete(args["name"])
+
+    if name == "email_run_saved_rules":
+        return await asyncio.to_thread(
+            _run_saved_rules,
+            args.get("rule_names"),
+            args.get("dry_run", True),
+            int(args.get("limit", 500)),
+            args.get("search", "ALL"),
+            args.get("case_sensitive", False),
+            args.get("match_mode", "first"),
         )
 
     raise ValueError(f"未知 tool: {name}")

@@ -894,6 +894,73 @@ async def test_create_folder_chinese():
     print("✅ test_create_folder_chinese PASS")
 
 
+import os as _os
+
+
+def _temp_rules_env():
+    """回傳 (set_fn, restore_fn)：把 MCP_EMAIL_RULES_FILE 指向新的暫存檔。"""
+    d = tempfile.mkdtemp()
+    path = str(Path(d) / "rules.json")
+    saved = _os.environ.get("MCP_EMAIL_RULES_FILE")
+
+    def restore():
+        if saved is None:
+            _os.environ.pop("MCP_EMAIL_RULES_FILE", None)
+        else:
+            _os.environ["MCP_EMAIL_RULES_FILE"] = saved
+    _os.environ["MCP_EMAIL_RULES_FILE"] = path
+    return restore
+
+
+async def test_rule_crud():
+    restore = _temp_rules_env()
+    try:
+        r = await srv._dispatch("email_save_rule", {
+            "rule": {"name": "r1", "from_contains": "x", "action": {"move_to": "A"}}})
+        assert r["saved"] == "r1" and r["total"] == 1, r
+        # 同名 upsert（不會變兩條）
+        await srv._dispatch("email_save_rule", {
+            "rule": {"name": "r1", "from_contains": "y", "action": {"move_to": "B"}}})
+        lst = await srv._dispatch("email_list_rules", {})
+        assert lst["count"] == 1 and lst["rules"][0]["enabled"] is True, lst
+        # disable
+        d = await srv._dispatch("email_disable_rule", {"name": "r1"})
+        assert d["enabled"] is False
+        assert (await srv._dispatch("email_list_rules", {}))["rules"][0]["enabled"] is False
+        # delete
+        dd = await srv._dispatch("email_delete_rule", {"name": "r1"})
+        assert dd["remaining"] == 0, dd
+        # 刪不存在 → error
+        try:
+            await srv._dispatch("email_delete_rule", {"name": "nope"})
+            assert False, "應該 raise"
+        except ValueError:
+            pass
+        print("✅ test_rule_crud PASS")
+    finally:
+        restore()
+
+
+async def test_run_saved_rules():
+    restore = _temp_rules_env()
+    async def run():
+        await srv._dispatch("email_save_rule", {"rule": {
+            "name": "alice", "folder": "INBOX", "from_contains": "alice",
+            "action": {"move_to": "Archive"}}})
+        await srv._dispatch("email_save_rule", {"rule": {
+            "name": "disabled-bob", "folder": "INBOX", "from_contains": "bob",
+            "enabled": False, "action": {"delete": True}}})
+        # 只跑 enabled（alice）；disabled-bob 不該跑
+        out = await srv._dispatch("email_run_saved_rules", {"dry_run": True})
+        assert out["ran"] == 1 and out["rules"] == ["alice"], out
+        assert out["results"][0]["matched"] == 1, out  # alice 命中 uid 101
+    try:
+        await _with_fake_imap(run)
+        print("✅ test_run_saved_rules PASS")
+    finally:
+        restore()
+
+
 async def main():
     tests = [
         test_simple_text,
@@ -939,6 +1006,9 @@ async def main():
         test_apply_rules_subject_contains_any,
         test_move_partial_failure,
         test_create_folder_chinese,
+        # 規則持久化
+        test_rule_crud,
+        test_run_saved_rules,
     ]
     passed = 0
     for t in tests:
