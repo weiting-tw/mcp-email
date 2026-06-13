@@ -18,7 +18,7 @@
 | `email_delete` | 標記 `\Deleted` 並 expunge（UID EXPUNGE） |
 | `email_create_folder` | 建立 folder（支援中文，自動 modified UTF-7；已存在不報錯） |
 | `email_move_messages` | 搬信：UID MOVE，server 不支援則 COPY + UID EXPUNGE fallback |
-| `email_apply_rules` | 規則整理：掃描後依條件 move/mark/delete，支援 `dry_run` 預覽 |
+| `email_apply_rules` | 規則整理：掃描後依條件 move/mark/delete，`dry_run` 預覽；比對方式可調（`match`: substring/regex/exact、`case_sensitive`、`match_mode`: first/all） |
 
 對應使用者需求：
 - 📤 寄信 HTML + 純文字 ✅（multipart/alternative，純文字 fallback 自動）

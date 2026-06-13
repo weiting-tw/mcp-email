@@ -701,47 +701,84 @@ def _imap_move_messages(source: str, uids: list[str], dest: str) -> dict[str, An
                 "source": source, "destination": dest}
 
 
-def _rule_matches(rule: dict[str, Any], frm_lower: str, subj_lower: str) -> bool:
-    """子字串 + 大小寫不敏感比對。空規則（無任何條件）一律不命中（安全）。"""
+def _make_matcher(match_type: str, case_sensitive: bool):
+    """回傳 contains(haystack, needle) -> bool。
+
+    match_type: 'substring'（預設）/ 'regex' / 'exact'。
+    case_sensitive=False 時：substring/exact 兩邊轉小寫；regex 加 IGNORECASE。
+    """
+    if match_type == "regex":
+        flags = 0 if case_sensitive else re.IGNORECASE
+        def _re(haystack: str, needle: str) -> bool:
+            try:
+                return re.search(needle, haystack, flags) is not None
+            except re.error:
+                return False
+        return _re
+    if match_type == "exact":
+        if case_sensitive:
+            return lambda h, n: h == n
+        return lambda h, n: h.lower() == n.lower()
+    # substring（預設）
+    if case_sensitive:
+        return lambda h, n: n in h
+    return lambda h, n: n.lower() in h.lower()
+
+
+def _rule_matches(rule: dict[str, Any], frm: str, subj: str, case_sensitive: bool) -> bool:
+    """依規則比對。空規則（無任何條件）一律不命中（安全）。
+
+    每條規則可用 rule['match'] 指定 'substring'(預設) / 'regex' / 'exact'。
+    """
+    contains = _make_matcher(rule.get("match", "substring"), case_sensitive)
     has_cond = False
     fc = rule.get("from_contains")
     if fc:
         has_cond = True
-        if fc.lower() not in frm_lower:
+        if not contains(frm, fc):
             return False
     all_subs = rule.get("subject_contains_all") or []
     if all_subs:
         has_cond = True
-        if not all(s.lower() in subj_lower for s in all_subs):
+        if not all(contains(subj, s) for s in all_subs):
             return False
     any_subs = rule.get("subject_contains_any") or []
     if any_subs:
         has_cond = True
-        if not any(s.lower() in subj_lower for s in any_subs):
+        if not any(contains(subj, s) for s in any_subs):
             return False
     return has_cond
 
 
 def _imap_apply_rules(folder: str, limit: int, search: str,
-                      rules: list[dict[str, Any]], dry_run: bool) -> dict[str, Any]:
+                      rules: list[dict[str, Any]], dry_run: bool,
+                      case_sensitive: bool = False,
+                      match_mode: str = "first") -> dict[str, Any]:
     msgs = _imap_list_messages(folder, limit, search)
-    hits: list[dict[str, Any]] = []  # 每封命中的（first-match）
+    hits: list[dict[str, Any]] = []          # 命中明細（給 dry_run / by_rule）
+    per_uid: dict[str, list[dict[str, Any]]] = {}  # uid -> 命中的 rules（依序）
     for m in msgs:
-        frm = (m.get("from") or "").lower()
-        subj = (m.get("subject") or "").lower()
+        frm = m.get("from") or ""
+        subj = m.get("subject") or ""
+        uid = m.get("uid")
         for rule in rules:
-            if _rule_matches(rule, frm, subj):
-                hits.append({"uid": m.get("uid"), "rule": rule.get("name"),
+            if _rule_matches(rule, frm, subj, case_sensitive):
+                hits.append({"uid": uid, "rule": rule.get("name"),
                              "from": m.get("from"), "subject": m.get("subject"),
                              "action": rule.get("action") or {}})
-                break  # first-match-wins
+                if uid:
+                    per_uid.setdefault(uid, []).append(rule)
+                if match_mode == "first":
+                    break  # 一封信只套第一條命中的規則
 
     by_rule: dict[str, int] = {}
     for h in hits:
         by_rule[h["rule"] or "?"] = by_rule.get(h["rule"] or "?", 0) + 1
 
     summary = {
-        "folder": folder, "scanned": len(msgs), "matched": len(hits),
+        "folder": folder, "scanned": len(msgs),
+        "matched": len(hits), "matched_messages": len(per_uid),
+        "match_mode": match_mode, "case_sensitive": case_sensitive,
         "by_rule": by_rule, "dry_run": dry_run,
         "preview": [{"uid": h["uid"], "rule": h["rule"],
                      "from": h["from"], "subject": h["subject"],
@@ -750,21 +787,23 @@ def _imap_apply_rules(folder: str, limit: int, search: str,
     if dry_run:
         return summary
 
-    # 真正執行：依 action 分組
+    # 每封信解析出單一有效動作（優先序：move > delete > mark）
+    # —— move 後信已離開原 folder，後續用 UID 標記/刪除會失效，故以此優先序避免衝突。
     executed = {"moved": 0, "marked": 0, "deleted": 0, "failed": []}
-    moves: dict[str, list[str]] = {}   # dest -> uids
-    marks: list[tuple[str, str, bool]] = []  # (uid, flag, add)
+    moves: dict[str, list[str]] = {}
+    marks: list[tuple[str, str, bool]] = []
     deletes: list[str] = []
-    for h in hits:
-        uid, act = h["uid"], h["action"]
-        if not uid:
-            continue
-        if "move_to" in act:
-            moves.setdefault(act["move_to"], []).append(uid)
-        elif "delete" in act and act["delete"]:
+    for uid, matched_rules in per_uid.items():
+        actions = [r.get("action") or {} for r in matched_rules]
+        move_dest = next((a["move_to"] for a in actions if a.get("move_to")), None)
+        if move_dest:
+            moves.setdefault(move_dest, []).append(uid)
+        elif any(a.get("delete") for a in actions):
             deletes.append(uid)
-        elif "mark" in act:
-            marks.append((uid, act["mark"], act.get("add", True)))
+        else:
+            for a in actions:
+                if a.get("mark"):
+                    marks.append((uid, a["mark"], a.get("add", True)))
 
     for dest, uids in moves.items():
         r = _imap_move_messages(folder, uids, dest)
@@ -1006,7 +1045,8 @@ async def list_tools() -> list[Tool]:
             name="email_apply_rules",
             description=(
                 "掃描 folder 後，依規則對信件做 move / mark / delete。"
-                "比對為子字串、大小寫不敏感、first-match-wins（一封信只套第一條命中的規則）。"
+                "預設：子字串、大小寫不敏感、first-match-wins（一封信只套第一條命中的規則）。"
+                "可用 case_sensitive / match_mode 與每條規則的 match(substring|regex|exact) 調整。"
                 "強烈建議先 dry_run=true 預覽命中數與前幾封，確認無誤再執行。"
             ),
             inputSchema={
@@ -1021,12 +1061,25 @@ async def list_tools() -> list[Tool]:
                         "description": "可選 IMAP search 先在 server 端縮小掃描範圍（大信箱建議用）",
                     },
                     "dry_run": {"type": "boolean", "default": True},
+                    "case_sensitive": {
+                        "type": "boolean", "default": False,
+                        "description": "比對是否區分大小寫（預設否）",
+                    },
+                    "match_mode": {
+                        "type": "string", "enum": ["first", "all"], "default": "first",
+                        "description": "first=一封只套第一條命中規則；all=套用所有命中規則（執行優先序 move>delete>mark）",
+                    },
                     "rules": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "name": {"type": "string"},
+                                "match": {
+                                    "type": "string", "enum": ["substring", "regex", "exact"],
+                                    "default": "substring",
+                                    "description": "此規則的比對方式",
+                                },
                                 "from_contains": {"type": "string"},
                                 "subject_contains_all": {"type": "array", "items": {"type": "string"}},
                                 "subject_contains_any": {"type": "array", "items": {"type": "string"}},
@@ -1194,10 +1247,15 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
         limit = int(args.get("limit", 200))
         search = args.get("search", "ALL")
         dry_run = args.get("dry_run", True)
+        case_sensitive = args.get("case_sensitive", False)
+        match_mode = args.get("match_mode", "first")
         rules = args.get("rules") or []
         if not rules:
             raise ValueError("rules 不可為空")
-        return await asyncio.to_thread(_imap_apply_rules, folder, limit, search, rules, dry_run)
+        return await asyncio.to_thread(
+            _imap_apply_rules, folder, limit, search, rules, dry_run,
+            case_sensitive, match_mode,
+        )
 
     raise ValueError(f"未知 tool: {name}")
 

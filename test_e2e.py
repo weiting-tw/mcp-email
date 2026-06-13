@@ -743,6 +743,51 @@ async def test_apply_rules_empty_rule_no_match():
     print("✅ test_apply_rules_empty_rule_no_match PASS")
 
 
+async def test_apply_rules_regex_and_case_sensitive():
+    """match=regex 比對；case_sensitive=True 時大小寫需吻合。"""
+    async def run():
+        # regex：subject 結尾為「主旨」的（uid 101 = 測試主旨）
+        out = await srv._dispatch("email_apply_rules", {
+            "folder": "INBOX", "dry_run": True,
+            "rules": [{"name": "re", "match": "regex", "subject_contains_all": ["主旨$"],
+                       "action": {"delete": True}}],
+        })
+        assert out["matched"] == 1 and out["preview"][0]["uid"] == "101", out
+
+        # case_sensitive：大寫 ALICE 不該命中小寫的 from
+        out2 = await srv._dispatch("email_apply_rules", {
+            "folder": "INBOX", "dry_run": True, "case_sensitive": True,
+            "rules": [{"name": "cs", "from_contains": "ALICE", "action": {"delete": True}}],
+        })
+        assert out2["matched"] == 0, out2
+    await _with_fake_imap(run)
+    print("✅ test_apply_rules_regex_and_case_sensitive PASS")
+
+
+async def test_apply_rules_exact_and_match_mode_all():
+    """match=exact 完全相等；match_mode=all 一封信可被多條規則命中。"""
+    async def run():
+        # exact：subject 完全等於「第二封」(uid 102)
+        out = await srv._dispatch("email_apply_rules", {
+            "folder": "INBOX", "dry_run": True,
+            "rules": [{"name": "ex", "match": "exact", "subject_contains_all": ["第二封"],
+                       "action": {"mark": "\\Flagged"}}],
+        })
+        assert out["matched"] == 1 and out["preview"][0]["uid"] == "102", out
+
+        # match_mode=all：兩條都命中 uid 101 → matched(hit 數)=2、但 matched_messages=1
+        allout = await srv._dispatch("email_apply_rules", {
+            "folder": "INBOX", "dry_run": True, "match_mode": "all",
+            "rules": [
+                {"name": "byfrom", "from_contains": "alice", "action": {"mark": "\\Flagged"}},
+                {"name": "bysubj", "subject_contains_all": ["測試主旨"], "action": {"delete": True}},
+            ],
+        })
+        assert allout["matched"] == 2 and allout["matched_messages"] == 1, allout
+    await _with_fake_imap(run)
+    print("✅ test_apply_rules_exact_and_match_mode_all PASS")
+
+
 async def main():
     tests = [
         test_simple_text,
@@ -779,6 +824,8 @@ async def main():
         test_move_to_missing_folder_errors,
         test_apply_rules_dry_run_and_execute,
         test_apply_rules_empty_rule_no_match,
+        test_apply_rules_regex_and_case_sensitive,
+        test_apply_rules_exact_and_match_mode_all,
     ]
     passed = 0
     for t in tests:
