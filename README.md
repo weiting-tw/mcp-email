@@ -4,7 +4,7 @@
 
 純 Python 單模組實作（`mcp_email.py`），把任意支援 IMAP / SMTP 的標準信箱（Gmail / Outlook / Yahoo / iCloud / Zoho / 公司 Exchange / 自架 mail server …）包成 MCP tools 給 Claude / Claude Code / Cowork / 任何 MCP host 用。
 
-## 能做什麼（16 個 tools）
+## 能做什麼（11 個 tools）
 
 | Tool | 用途 |
 |---|---|
@@ -19,11 +19,6 @@
 | `email_create_folder` | 建立 folder（支援中文，自動 modified UTF-7；已存在不報錯） |
 | `email_move_messages` | 搬信：UID MOVE，server 不支援則 COPY + UID EXPUNGE fallback |
 | `email_apply_rules` | 規則整理：掃描後依條件 move/mark/delete，`dry_run` 預覽；比對方式可調（`match`: substring/regex/exact、`case_sensitive`、`match_mode`: first/all） |
-| `email_save_rule` | 把規則存到本機（`~/.config/mcp-email/rules.json`，atomic write），同名 upsert |
-| `email_list_rules` | 列出已儲存規則（含 enabled 狀態），方便檢查危險規則 |
-| `email_disable_rule` | 啟用/停用某條規則（不刪除，較安全） |
-| `email_delete_rule` | 永久刪除某條規則 |
-| `email_run_saved_rules` | 執行已儲存規則（給排程用）；省略 `rule_names`=跑全部 enabled，預設 `dry_run` |
 
 對應使用者需求：
 - 📤 寄信 HTML + 純文字 ✅（multipart/alternative，純文字 fallback 自動）
