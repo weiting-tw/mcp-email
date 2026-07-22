@@ -261,10 +261,21 @@ failregex = mcp-email-login-fail ip=<HOST>
 
 ### Docker 部署
 
+現成多架構 image（linux/amd64 + linux/arm64，打 `v*` tag 由 GitHub Actions 自動發佈）：
+
+```bash
+# GHCR（免登入即可 pull）
+docker pull ghcr.io/weiting-tw/mcp-email:latest
+# Docker Hub（維護者設定 DOCKERHUB_* secret 後才會發佈）
+docker pull weiting-tw/mcp-email:latest
+```
+
+或自己建：
+
 ```bash
 docker build -t mcp-email .
 
-# HTTP 模式
+# HTTP 模式（把 mcp-email 換成上面的 image 名稱亦可）
 docker run -d -p 8765:8765 \
   -e IMAP_HOST=mail.example.com -e SMTP_HOST=mail.example.com \
   mcp-email
