@@ -244,9 +244,10 @@ claude.ai 端：設定 → 連接器（Connectors）→ 新增自訂連接器 �
 不進版控（repo 的 `.gitignore` 已排除 `.bridge-key`），有疑慮就換金鑰
 （代價只是所有人重新授權一次）。
 
-內建防護：登入失敗節流（同 IP / 全域滑動視窗，避免上游信箱服務封鎖
-bridge 的 IP）、同授權交易密碼錯誤 5 次作廢、登入頁安全標頭、
-auth log 自我輪替。搭配 fail2ban 的 filter 範例：
+內建防護：登入頁**同意畫面**（顯示發起授權的應用程式名稱＋授權碼送達的
+網域，讓使用者辨識並攔截釣魚連結）、登入失敗節流（同 IP / 全域滑動視窗，
+避免上游信箱服務封鎖 bridge 的 IP）、同授權交易密碼錯誤 5 次作廢、
+登入頁安全標頭、auth log 自我輪替。搭配 fail2ban 的 filter 範例：
 
 ```ini
 # /etc/fail2ban/filter.d/mcp-email.conf
@@ -285,6 +286,20 @@ mail-mcp.example.com {
 nginx 使用者：`proxy_pass http://127.0.0.1:8765;` 並保留
 `proxy_set_header Host $host;`；SSE 緩衝不用另外關（server 回應已帶
 `X-Accel-Buffering: no`）。設好代理後記得配 `EMAIL_ALLOWED_HOSTS=mail-mcp.example.com`。
+
+### 遠端部署上線前檢查清單
+
+上線 `--http` / `--oauth` 前逐項確認，尤其打 ✅ 的三項是實務上最常害人踩雷的：
+
+- [ ] **HTTPS 反向代理**：帳密/token 是明文等級傳輸，一定要放在 TLS 後面，絕不裸跑對外。
+- [ ] **`EMAIL_ALLOWED_HOSTS`**：設成你的對外網域，否則 SDK 的 DNS-rebinding 防護會回 `421 Invalid Host header`。
+- [ ] ✅ **OAuth 金鑰要持久化**：`--oauth` 一定要掛 `-v mcp-email-data:/data`（或設固定的 `EMAIL_BRIDGE_KEY`）。**沒掛 volume→容器每次重啟都重新產生金鑰→所有人 token 全失效、要重新授權**，這是最常見的災情。
+- [ ] ✅ **金鑰檔權限**：`.bridge-key`（或 `/data`）只給執行帳號讀；拿到金鑰的人可解開所有已發 token 內的使用者憑證。已在 `.gitignore` 排除，切勿進版控。
+- [ ] ✅ **用應用程式專用密碼**：宣導使用者在登入頁輸入 App Password，不要用信箱主密碼——外洩時只波及收發信、可單獨撤銷。
+- [ ] **同意畫面**：登入頁會顯示「哪個應用程式要連你的信箱」＋「授權碼送達的網域」；提醒使用者只在認得目的地時才繼續（防釣魚）。
+- [ ] **失敗節流 / fail2ban**：設 `EMAIL_AUTH_LOG` 並掛 fail2ban（filter 範例見上），擋帳密暴力猜測。
+- [ ] **`path` 附件**：遠端模式預設停用；若確有需求才用 `EMAIL_ATTACHMENT_DIRS` 白名單開放，範圍越小越好。
+- [ ] **token 生命週期已知**：access 1 小時（自動續）、refresh 30 天（活躍使用者滾動不過期）；使用者改密碼＝所有舊 token 失效（需重新授權），這是刻意的撤銷機制。
 
 ## 常見信箱設定
 
