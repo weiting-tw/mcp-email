@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-email"
-version = "0.2.0"
-description = "本地 IMAP/SMTP 信箱 MCP server — 把任意標準信箱（Gmail/Outlook/自架…）包成 MCP tools"
+version = "0.3.0"
+description = "IMAP/SMTP 信箱 MCP server — 把任意標準信箱（Gmail/Outlook/自架…）包成 MCP tools；支援本地 stdio 與遠端 HTTP/OAuth 部署"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
@@ -18,10 +18,11 @@ classifiers = [
     "Topic :: Communications :: Email",
     "Operating System :: OS Independent",
 ]
-dependencies = ["mcp[cli]>=1.0.0"]
+dependencies = ["mcp[cli]>=1.28"]
 
 [project.optional-dependencies]
-dev = ["aiosmtpd>=1.4"]
+oauth = ["cryptography>=42"]   # --oauth 模式（claude.ai Connectors）才需要
+dev = ["aiosmtpd>=1.4", "cryptography>=42", "pytest>=8"]
 
 [project.scripts]
 mcp-email = "mcp_email:cli"
@@ -32,4 +33,4 @@ Repository = "https://github.com/weiting-tw/mcp-email"
 Issues = "https://github.com/weiting-tw/mcp-email/issues"
 
 [tool.setuptools]
-py-modules = ["mcp_email"]
+py-modules = ["mcp_email", "mcp_email_oauth"]
