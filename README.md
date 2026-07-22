@@ -12,21 +12,31 @@
 | **HTTP** | `mcp-email --http` | 內網多人共用（Claude Code / Desktop 遠端連線） | 每請求 `Authorization: Basic`，伺服器不存帳密 |
 | **OAuth** | `mcp-email --oauth --issuer …` | claude.ai Connectors（手機 app / 網頁版） | OAuth 2.1 + 無狀態加密 token，伺服器不存帳密 |
 
-## 能做什麼（11 個 tools）
+## 能做什麼（13 個 tools）
 
 | Tool | 用途 |
 |---|---|
 | `email_configure` | Runtime 動態切換 SMTP / IMAP 帳密、port、TLS |
 | `email_test_connection` | 一鍵測 SMTP + IMAP 是否能登入 |
 | `email_send` | 寄信：HTML + 純文字、to/cc/bcc、檔案/Base64 附件、Reply-To、自訂 headers、retry |
+| `email_reply` | 回覆某封信：自動帶 `Re:` 主旨與 `In-Reply-To`/`References` 串接對話，可 reply_all、引用原文 |
 | `email_list_folders` | IMAP 列出所有 mailbox 名稱（中文名稱自動解碼） |
 | `email_list_messages` | 列出 folder 內訊息 header（支援 IMAP search syntax） |
-| `email_get_message` | 抓單封信完整內容（body text/html、附件 metadata、選擇是否標 SEEN） |
+| `email_get_message` | 抓單封信完整內容（body text/html、附件 metadata 含 index、選擇是否標 SEEN） |
+| `email_get_attachment` | 下載單封信裡某個附件的實際內容（base64），以 filename 或 index 指定 |
 | `email_mark` | 加/移除 IMAP flag（`\Seen` / `\Flagged` 等） |
 | `email_delete` | 標記 `\Deleted` 並 expunge（UID EXPUNGE） |
 | `email_create_folder` | 建立 folder（支援中文，自動 modified UTF-7；已存在不報錯） |
 | `email_move_messages` | 搬信：UID MOVE，server 不支援則 COPY + UID EXPUNGE fallback |
 | `email_apply_rules` | 規則整理：掃描後依條件 move/mark/delete，`dry_run` 預覽；比對方式可調（`match`: substring/regex/exact、`case_sensitive`、`match_mode`: first/all） |
+
+### Prompts（在支援的 client 顯示成 slash command）
+
+| Prompt | 用途 |
+|---|---|
+| `triage_inbox` | 分流信箱：列未讀 → 摘要 → 建議動作（參數：folder、limit） |
+| `weekly_cleanup` | 每週整理：引導 `apply_rules` 先 dry-run 再執行的安全流程（參數：folder） |
+| `draft_reply` | 讀取指定信件並草擬回覆、確認後才寄（參數：uid、folder、tone） |
 
 對應使用者需求：
 - 📤 寄信 HTML + 純文字 ✅（multipart/alternative，純文字 fallback 自動）
@@ -91,7 +101,7 @@ pip install -r requirements-dev.txt
 
 # 跑端到端測試（in-process 假 SMTP + 假 IMAP）
 python test_e2e.py
-# 預期：=== 39/39 passed ===
+# 預期：=== 43/43 passed ===
 
 # 遠端（--http/--oauth）模式測試
 python -m pytest test_remote.py -q
@@ -467,13 +477,13 @@ fallback 成「以剩餘 ASCII 條件縮小範圍 → 抓 header 在客戶端比
 ## 驗證測試結果
 
 ```
-=== 39/39 passed ===
+=== 43/43 passed ===
 ```
 
 另有 `test_mcp_stdio.py`：用真正的 MCP client 把 `mcp_email.py` 以 stdio 子行程啟動，
 跑完整 `initialize` → `list_tools` → 呼叫 tool 的 handshake，驗證能被任何 MCP host 載入。
 
-以及 `test_remote.py`（29 tests）：遠端模式的 Basic 標頭解析、每請求憑證覆蓋、
+以及 `test_remote.py`（37 tests）：遠端模式的 Basic 標頭解析、每請求憑證覆蓋、
 遠端限制（`email_configure` / `path` 附件停用、白名單 symlink 繞過）、
 OAuth token 加解密與 provider 流程（含失敗節流、狀態清理、DCR 上限淘汰）、
 in-process uvicorn 起真正 streamable-http server 的端對端測試——包括

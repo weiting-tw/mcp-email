@@ -85,7 +85,14 @@ from typing import Any, Optional
 from mcp.server import Server
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
+from mcp.types import (
+    GetPromptResult,
+    Prompt,
+    PromptArgument,
+    PromptMessage,
+    TextContent,
+    Tool,
+)
 
 # ─── logging（寫 stderr，stdout 留給 MCP 協定）─────────────────────────────
 logging.basicConfig(
@@ -94,7 +101,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("mcp-email")
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # 執行模式：stdio（預設，本機單人）/ http（Basic pass-through 多人共用）/
 # oauth（claude.ai Connectors）。由 cli() 依啟動參數設定。
@@ -764,16 +771,19 @@ def _imap_get_message(folder: str, uid: str, peek: bool = True) -> dict[str, Any
         body_html = ""
         atts = []
         if msg.is_multipart():
+            idx = 0
             for part in msg.walk():
                 ctype = part.get_content_type()
                 disp = part.get("Content-Disposition", "")
                 filename = part.get_filename()
                 if "attachment" in (disp or "").lower() or filename:
                     atts.append({
+                        "index": idx,  # 供 email_get_attachment 以序號指定
                         "filename": _decode_header(filename or "unknown"),
                         "mime_type": ctype,
                         "size": len(part.get_payload(decode=True) or b""),
                     })
+                    idx += 1
                 elif ctype == "text/plain" and not body_text:
                     body_text = part.get_content()
                 elif ctype == "text/html" and not body_html:
@@ -788,12 +798,56 @@ def _imap_get_message(folder: str, uid: str, peek: bool = True) -> dict[str, Any
             "from": _decode_header(msg.get("From", "")),
             "to": _decode_header(msg.get("To", "")),
             "cc": _decode_header(msg.get("Cc", "")),
+            "reply_to": _decode_header(msg.get("Reply-To", "")),
             "subject": _decode_header(msg.get("Subject", "")),
             "date": msg.get("Date", ""),
             "message_id": msg.get("Message-ID", ""),
+            "references": msg.get("References", ""),
             "body_text": body_text,
             "body_html": body_html,
             "attachments": atts,
+        }
+
+
+def _imap_get_attachment(folder: str, uid: str, filename: Optional[str] = None,
+                         index: Optional[int] = None) -> dict[str, Any]:
+    """抓單封信裡某個附件的實際內容（base64）。以 filename 或 index 指定其一。"""
+    with IMAPClient(_imap_cfg()) as conn:
+        _imap_select(conn, folder, readonly=True)
+        status, data = conn.uid("fetch", uid, "(BODY.PEEK[])")
+        if status != "OK" or not data or data[0] is None:
+            raise RuntimeError(f"fetch uid={uid} 失敗：{data!r}")
+        msg = email.message_from_bytes(data[0][1], policy=email.policy.default)
+        found: list[Any] = []
+        for part in msg.walk():
+            disp = part.get("Content-Disposition", "")
+            fn = part.get_filename()
+            if "attachment" in (disp or "").lower() or fn:
+                found.append((_decode_header(fn or "unknown"), part))
+        if not found:
+            raise ValueError(f"uid={uid} 沒有附件")
+        target = None
+        if filename:
+            for fn, part in found:
+                if fn == filename:
+                    target = (fn, part)
+                    break
+            if target is None:
+                names = [fn for fn, _ in found]
+                raise ValueError(f"找不到附件檔名：{filename}（可用：{names}）")
+        else:
+            i = index if index is not None else 0
+            if i < 0 or i >= len(found):
+                raise ValueError(f"附件 index 超出範圍：{i}（共 {len(found)} 個）")
+            target = found[i]
+        fn, part = target
+        payload = part.get_payload(decode=True) or b""
+        return {
+            "uid": uid,
+            "filename": fn,
+            "mime_type": part.get_content_type(),
+            "size": len(payload),
+            "content_base64": base64.b64encode(payload).decode("ascii"),
         }
 
 
@@ -1339,6 +1393,60 @@ async def list_tools() -> list[Tool]:
                 },
             },
         ),
+        Tool(
+            name="email_get_attachment",
+            description=(
+                "抓取單封信裡某個附件的實際內容（回 base64）。"
+                "先用 email_get_message 看附件清單，再以 filename 或 index 指定其一。"
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["uid"],
+                "properties": {
+                    "folder": {"type": "string", "default": "INBOX"},
+                    "uid": {"type": "string"},
+                    "filename": {"type": "string", "description": "附件檔名（與 index 擇一）"},
+                    "index": {"type": "integer", "description": "附件序號，0 起（與 filename 擇一，預設 0）"},
+                },
+            },
+        ),
+        Tool(
+            name="email_reply",
+            description=(
+                "回覆某封信：自動帶 Re: 主旨與 In-Reply-To/References 讓對話正確串接，"
+                "收件人預設為原寄件人（reply_all=true 則含原 To/Cc、去除自己）。"
+                "可選 quote_original 引用原文。body 用 text / html。"
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["uid"],
+                "properties": {
+                    "folder": {"type": "string", "default": "INBOX"},
+                    "uid": {"type": "string"},
+                    "text": {"type": "string", "description": "純文字內容"},
+                    "html": {"type": "string", "description": "HTML 內容"},
+                    "reply_all": {"type": "boolean", "default": False,
+                                  "description": "回覆全部（含原 To/Cc，去除自己）"},
+                    "quote_original": {"type": "boolean", "default": False,
+                                       "description": "在回覆內容後附上引用的原文"},
+                    "cc": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "bcc": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "from": {"type": "string", "description": "覆蓋預設 From"},
+                    "attachments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content_base64": {"type": "string"},
+                                "filename": {"type": "string"},
+                                "mime_type": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
+        ),
     ]
     if MODE != "stdio":
         # 遠端多人共用：全域設定不容任一使用者改動，直接不列出
@@ -1521,6 +1629,86 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
             case_sensitive, match_mode,
         )
 
+    if name == "email_get_attachment":
+        folder = args.get("folder", "INBOX")
+        uid = str(args["uid"])
+        filename = args.get("filename")
+        index = args.get("index")
+        if index is not None:
+            index = int(index)
+        return await asyncio.to_thread(_imap_get_attachment, folder, uid, filename, index)
+
+    if name == "email_reply":
+        folder = args.get("folder", "INBOX")
+        uid = str(args["uid"])
+        smtp_cfg = _smtp_cfg()
+        creds = _REQ_CREDS.get()
+        if MODE != "stdio" and creds is None:
+            raise PermissionError("遠端模式缺少本次請求的憑證，拒絕以伺服器身分寄信")
+        me = creds[0] if creds else (CONFIG.email_from or smtp_cfg.username)
+        sender = args.get("from") or me
+        if not sender:
+            raise RuntimeError("找不到寄件人：請設定 EMAIL_FROM 或 email_configure({email_from:...})")
+
+        orig = await asyncio.to_thread(_imap_get_message, folder, uid, True)
+        # 收件人：預設回原寄件人（優先 Reply-To），reply_all 再加原 To/Cc、去除自己
+        reply_target = _parse_addresses(orig.get("reply_to") or orig.get("from"))
+        to = list(reply_target)
+        cc = _parse_addresses(args.get("cc"))
+        if args.get("reply_all"):
+            for addr in _parse_addresses(orig.get("to")) + _parse_addresses(orig.get("cc")):
+                if addr not in to and addr not in cc:
+                    cc.append(addr)
+        me_lower = (me or "").lower()
+        to = [a for a in to if a.lower() != me_lower] or reply_target
+        cc = [a for a in cc if a.lower() != me_lower]
+        bcc = _parse_addresses(args.get("bcc"))
+        if not to:
+            raise ValueError("找不到可回覆的收件人")
+
+        subj = orig.get("subject") or ""
+        if not subj.lower().startswith("re:"):
+            subj = "Re: " + subj
+
+        text = args.get("text")
+        html = args.get("html")
+        if args.get("quote_original"):
+            q_from = orig.get("from", "")
+            q_date = orig.get("date", "")
+            if text is not None or html is None:
+                quoted = "\n".join("> " + ln for ln in (orig.get("body_text") or "").splitlines())
+                text = (text or "") + f"\n\n在 {q_date}，{q_from} 寫道：\n{quoted}"
+            if html is not None:
+                html += (f"<br><br><blockquote>在 {q_date}，{q_from} 寫道：<br>"
+                         f"{orig.get('body_html') or orig.get('body_text') or ''}</blockquote>")
+
+        # threading header：In-Reply-To 指原信、References 串上原 References
+        omid = orig.get("message_id") or ""
+        refs = " ".join(x for x in [orig.get("references") or "", omid] if x).strip()
+        headers = {}
+        if omid:
+            headers["In-Reply-To"] = omid
+        if refs:
+            headers["References"] = refs
+
+        msg = _build_message(
+            sender=sender, to=to, cc=cc, bcc=bcc, subject=subj,
+            text=text, html=html, reply_to=None, headers=headers or None,
+            attachments=args.get("attachments"),
+        )
+        recipients = list(dict.fromkeys(to + cc + bcc))
+        started = time.time()
+        result = await _retry(
+            lambda: _send_via_smtp(smtp_cfg, msg, recipients),
+            max_retries=CONFIG.retry_max, base_delay=CONFIG.retry_base_delay,
+            what="SMTP reply",
+        )
+        return {
+            "ok": True, "in_reply_to": omid, "to": to, "cc": cc, "bcc": bcc,
+            "subject": subj, "refused_addresses": result.get("refused", {}),
+            "elapsed_sec": round(time.time() - started, 3),
+        }
+
     raise ValueError(f"未知 tool: {name}")
 
 
@@ -1551,6 +1739,88 @@ def _config_summary() -> dict[str, Any]:
         "retry_base_delay": CONFIG.retry_base_delay,
         "attachment_allowed_dirs": CONFIG.attachment_allowed_dirs,
     }
+
+
+# ─── MCP prompts（在支援的 client 顯示成 slash command）──────────────────────
+# 每個 prompt 產生一段「使用者訊息」，引導模型用既有 email_* 工具完成一個常見流程。
+_PROMPTS: dict[str, dict[str, Any]] = {
+    "triage_inbox": {
+        "description": "分流信箱：列出未讀、摘要、並建議後續動作",
+        "arguments": [
+            {"name": "folder", "description": "資料夾（預設 INBOX）", "required": False},
+            {"name": "limit", "description": "最多處理幾封（預設 20）", "required": False},
+        ],
+        "render": lambda a: (
+            f"請幫我分流「{a.get('folder', 'INBOX')}」信箱：\n"
+            f"1. 用 email_list_messages（folder={a.get('folder', 'INBOX')}, "
+            f"search=UNSEEN, limit={a.get('limit', 20)}）列出未讀信。\n"
+            "2. 對每封用一句話摘要寄件人與主旨重點。\n"
+            "3. 依重要性分組（需回覆 / 可稍後 / 可封存或刪除），"
+            "並針對需回覆的建議下一步；先不要真的動作，等我確認。"
+        ),
+    },
+    "weekly_cleanup": {
+        "description": "每週整理：以規則安全地 move/mark/delete（先 dry-run 再執行）",
+        "arguments": [
+            {"name": "folder", "description": "資料夾（預設 INBOX）", "required": False},
+        ],
+        "render": lambda a: (
+            f"幫我整理「{a.get('folder', 'INBOX')}」。\n"
+            "1. 先提議一組 email_apply_rules 規則（依常見寄件人/主旨分類到資料夾、"
+            "或標記、或刪除廣告）。\n"
+            "2. 一定要先用 dry_run=true 執行，把命中數與前幾封列給我看。\n"
+            "3. 我確認後，需要建立的目的資料夾先用 email_create_folder，"
+            "再以 dry_run=false 實際執行。全程逐步跟我確認。"
+        ),
+    },
+    "draft_reply": {
+        "description": "草擬回覆：讀取指定信件並擬一封回信（不直接寄出）",
+        "arguments": [
+            {"name": "uid", "description": "要回覆的信件 UID", "required": True},
+            {"name": "folder", "description": "資料夾（預設 INBOX）", "required": False},
+            {"name": "tone", "description": "語氣，如 正式 / 親切 / 簡短", "required": False},
+        ],
+        "render": lambda a: (
+            f"請先用 email_get_message（folder={a.get('folder', 'INBOX')}, "
+            f"uid={a.get('uid', '?')}）讀取這封信，"
+            f"再幫我草擬一封{('（' + a['tone'] + '語氣）') if a.get('tone') else ''}回覆。\n"
+            "把草稿內容列給我看、先不要寄出；我確認後再用 email_reply（帶同一個 uid）送出。"
+        ),
+    },
+}
+
+
+async def list_prompts() -> list[Prompt]:
+    return [
+        Prompt(
+            name=name,
+            description=spec["description"],
+            arguments=[PromptArgument(**arg) for arg in spec["arguments"]],
+        )
+        for name, spec in _PROMPTS.items()
+    ]
+
+
+async def get_prompt(name: str, arguments: Optional[dict[str, str]] = None) -> GetPromptResult:
+    spec = _PROMPTS.get(name)
+    if spec is None:
+        raise ValueError(f"未知 prompt: {name}")
+    args = arguments or {}
+    missing = [a["name"] for a in spec["arguments"]
+               if a.get("required") and not args.get(a["name"])]
+    if missing:
+        raise ValueError(f"prompt {name} 缺少必填參數：{missing}")
+    return GetPromptResult(
+        description=spec["description"],
+        messages=[PromptMessage(
+            role="user",
+            content=TextContent(type="text", text=spec["render"](args)),
+        )],
+    )
+
+
+server.list_prompts()(list_prompts)
+server.get_prompt()(get_prompt)
 
 
 # ─── entry ────────────────────────────────────────────────────────────────
@@ -1606,6 +1876,8 @@ def build_remote_server(host: str, port: int, oauth: bool = False,
     fm._mcp_server.version = __version__
     fm._mcp_server.list_tools()(list_tools)
     fm._mcp_server.call_tool()(call_tool)
+    fm._mcp_server.list_prompts()(list_prompts)
+    fm._mcp_server.get_prompt()(get_prompt)
     fm.settings.host = host
     fm.settings.port = port
     return fm

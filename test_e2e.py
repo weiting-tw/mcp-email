@@ -894,6 +894,119 @@ async def test_create_folder_chinese():
     print("✅ test_create_folder_chinese PASS")
 
 
+async def test_imap_get_attachment():
+    import base64 as _b64
+
+    async def run():
+        # 以 index 預設（0）
+        out = await srv._dispatch("email_get_attachment", {"folder": "INBOX", "uid": "101"})
+        assert out["filename"] == "doc.bin"
+        assert out["mime_type"] == "application/octet-stream"
+        assert _b64.b64decode(out["content_base64"]) == b"file data"
+        assert out["size"] == len(b"file data")
+        # 以 filename 指定
+        out2 = await srv._dispatch("email_get_attachment",
+                                   {"folder": "INBOX", "uid": "101", "filename": "doc.bin"})
+        assert _b64.b64decode(out2["content_base64"]) == b"file data"
+        # 找不到的檔名 → 錯誤
+        try:
+            await srv._dispatch("email_get_attachment",
+                                {"folder": "INBOX", "uid": "101", "filename": "nope.bin"})
+            assert False, "應該找不到附件"
+        except ValueError:
+            pass
+        # 沒附件的信 → 錯誤
+        try:
+            await srv._dispatch("email_get_attachment", {"folder": "INBOX", "uid": "102"})
+            assert False, "uid=102 無附件應報錯"
+        except ValueError:
+            pass
+    await _with_fake_imap(run)
+    print("✅ test_imap_get_attachment PASS")
+
+
+async def test_email_reply_threading():
+    """回覆 uid=101：收件人=原寄件人、主旨加 Re:、帶 In-Reply-To/References。"""
+    controller, handler = _start_smtpd(8041)
+
+    async def run():
+        await _configure(8041)  # email_from = sender@example.com
+        out = await srv._dispatch("email_reply", {
+            "folder": "INBOX", "uid": "101", "text": "收到，謝謝。",
+        })
+        assert out["ok"]
+        assert out["to"] == ["alice@example.com"]
+        assert out["subject"] == "Re: 測試主旨"
+        assert out["in_reply_to"] == "<msg101@example.com>"
+        msg = handler.messages[0]
+        assert msg["In-Reply-To"] == "<msg101@example.com>"
+        assert "<msg101@example.com>" in msg["References"]
+        assert msg["Subject"] == "Re: 測試主旨"
+        assert msg["To"] == "alice@example.com"
+
+    try:
+        await _with_fake_imap(run)
+        print("✅ test_email_reply_threading PASS")
+    finally:
+        controller.stop()
+
+
+async def test_email_reply_all_dedups_and_drops_self():
+    """reply_all：cc 併入原 To/Cc，去除自己、去重；主旨不重複加 Re:。"""
+    import email.policy
+    from email.message import EmailMessage
+
+    controller, handler = _start_smtpd(8042)
+
+    def factory():
+        m = EmailMessage(policy=email.policy.SMTP)
+        m["From"] = "Carol <carol@example.com>"
+        m["To"] = "sender@example.com, dave@example.com"
+        m["Cc"] = "ted@example.com"
+        m["Subject"] = "Re: 專案進度"           # 已有 Re:，不該再疊加
+        m["Message-ID"] = "<msg201@example.com>"
+        m.set_content("原文內容")
+        return _FakeIMAPConn({"201": m.as_bytes(policy=email.policy.SMTP)},
+                             capabilities=("IMAP4REV1", "UIDPLUS"))
+
+    async def run():
+        await _configure(8042)  # me = sender@example.com
+        out = await srv._dispatch("email_reply", {
+            "folder": "INBOX", "uid": "201", "text": "了解。", "reply_all": True,
+        })
+        assert out["to"] == ["carol@example.com"]
+        # cc = 原 To+Cc 去掉自己(sender) = dave, ted
+        assert set(out["cc"]) == {"dave@example.com", "ted@example.com"}
+        assert "sender@example.com" not in out["cc"] and "sender@example.com" not in out["to"]
+        assert out["subject"] == "Re: 專案進度"  # 沒有變成 Re: Re:
+
+    try:
+        await _with_fake_imap(run, factory=factory)
+        print("✅ test_email_reply_all_dedups_and_drops_self PASS")
+    finally:
+        controller.stop()
+
+
+async def test_email_reply_quote_original():
+    controller, handler = _start_smtpd(8043)
+
+    async def run():
+        await _configure(8043)
+        await srv._dispatch("email_reply", {
+            "folder": "INBOX", "uid": "101", "text": "回覆內容", "quote_original": True,
+        })
+        body = handler.messages[0].get_body(preferencelist=("plain",)).get_content()
+        assert "回覆內容" in body
+        assert "> 純文字 body" in body      # 原文被引用
+        assert "alice@example.com" in body  # 引用抬頭含原寄件人
+
+    try:
+        await _with_fake_imap(run)
+        print("✅ test_email_reply_quote_original PASS")
+    finally:
+        controller.stop()
+
+
 async def main():
     tests = [
         test_simple_text,
@@ -939,6 +1052,11 @@ async def main():
         test_apply_rules_subject_contains_any,
         test_move_partial_failure,
         test_create_folder_chinese,
+        # 新 tools：附件下載 + 回覆
+        test_imap_get_attachment,
+        test_email_reply_threading,
+        test_email_reply_all_dedups_and_drops_self,
+        test_email_reply_quote_original,
     ]
     passed = 0
     for t in tests:

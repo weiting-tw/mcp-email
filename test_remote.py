@@ -345,6 +345,34 @@ def test_all_pages_share_style(tmp_path):
         assert page.count("<style>") == 1
 
 
+# ─── MCP prompts ────────────────────────────────────────────────────────────
+def test_list_prompts():
+    names = [p.name for p in asyncio.run(srv.list_prompts())]
+    assert set(names) == {"triage_inbox", "weekly_cleanup", "draft_reply"}
+
+
+def test_get_prompt_renders_arguments():
+    r = asyncio.run(srv.get_prompt("triage_inbox", {"folder": "工作", "limit": "5"}))
+    text = r.messages[0].content.text
+    assert "工作" in text and "limit=5" in text
+    assert r.messages[0].role == "user"
+
+
+def test_get_prompt_defaults_when_arg_omitted():
+    r = asyncio.run(srv.get_prompt("triage_inbox", {}))
+    assert "INBOX" in r.messages[0].content.text  # 用預設值
+
+
+def test_get_prompt_required_arg_enforced():
+    with pytest.raises(ValueError):
+        asyncio.run(srv.get_prompt("draft_reply", {}))  # 缺 uid
+
+
+def test_get_prompt_unknown_name():
+    with pytest.raises(ValueError):
+        asyncio.run(srv.get_prompt("nope", {}))
+
+
 # ─── HTTP 傳輸端對端（in-process uvicorn + mcp client）────────────────────
 def _free_port() -> int:
     with socket.socket() as s:
@@ -401,6 +429,24 @@ def test_http_transport_rejects_missing_auth(http_server):
         http_server, {}, "email_test_connection", {"smtp": False, "imap": False}))
     assert result.content[0].text.startswith("❌")
     assert "Authorization" in result.content[0].text
+
+
+def test_http_transport_exposes_prompts(http_server):
+    """遠端模式也要透過 MCP client 曝露 prompts 並能 get_prompt。"""
+    async def flow():
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamablehttp_client
+        hdr = {"Authorization": _basic("alice@x.tw", "pw")}
+        async with streamablehttp_client(http_server, headers=hdr) as (read, write, _):
+            async with ClientSession(read, write) as sess:
+                await sess.initialize()
+                prompts = await sess.list_prompts()
+                got = await sess.get_prompt("draft_reply", {"uid": "9", "folder": "INBOX"})
+                return [p.name for p in prompts.prompts], got
+
+    names, got = asyncio.run(flow())
+    assert set(names) == {"triage_inbox", "weekly_cleanup", "draft_reply"}
+    assert "uid=9" in got.messages[0].content.text
 
 
 def test_http_passthrough_reaches_imap_login(http_server, monkeypatch):

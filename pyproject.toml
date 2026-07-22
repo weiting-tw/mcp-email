@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-email"
-version = "0.3.0"
+version = "0.4.0"
 description = "IMAP/SMTP 信箱 MCP server — 把任意標準信箱（Gmail/Outlook/自架…）包成 MCP tools；支援本地 stdio 與遠端 HTTP/OAuth 部署"
 readme = "README.md"
 requires-python = ">=3.10"
