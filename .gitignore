@@ -24,3 +24,4 @@ claude_desktop_config.json
 .bridge-key
 .oauth-clients.json
 auth.log*
+uv.lock
