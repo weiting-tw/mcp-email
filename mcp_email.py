@@ -78,7 +78,7 @@ import time
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from email.message import EmailMessage
-from email.utils import getaddresses
+from email.utils import getaddresses, parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -101,7 +101,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("mcp-email")
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 # 執行模式：stdio（預設，本機單人）/ http（Basic pass-through 多人共用）/
 # oauth（claude.ai Connectors）。由 cli() 依啟動參數設定。
@@ -142,6 +142,13 @@ class GlobalConfig:
     # 附件路徑白名單：非空時，attachments[].path 只允許落在這些目錄下（防任意檔案外洩）。
     # 空 list = 不限制（向後相容）。可用 EMAIL_ATTACHMENT_DIRS 或 email_configure 設定。
     attachment_allowed_dirs: list[str] = field(default_factory=list)
+    # email_get_attachment 單一附件回傳（base64）的大小上限（bytes），防止大附件撐爆
+    # 模型 context / 記憶體。可用 EMAIL_MAX_ATTACHMENT_BYTES 設定，或呼叫時以 max_bytes 覆蓋。
+    max_attachment_bytes: int = 5 * 1024 * 1024
+    # 收件人網域白名單（開關）：非空時 send/reply/forward/send_draft 的每個收件人
+    # 網域都必須在此清單，否則拒絕——防惡意信誘導模型對外亂寄。空 list = 關閉（不限制）。
+    # 可用 EMAIL_ALLOWED_RECIPIENT_DOMAINS（逗號分隔）或 email_configure 設定。
+    allowed_recipient_domains: list[str] = field(default_factory=list)
 
 
 def _bool_env(name: str, default: bool) -> bool:
@@ -181,6 +188,18 @@ def _load_dotenv(path: Optional[str] = None) -> Optional[str]:
                 os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
         return p
     return None
+
+
+def _parse_domain_list(raw: Optional[str]) -> list[str]:
+    """把逗號分隔的網域字串拆成小寫 list（去掉可能的前導 @）。"""
+    if not raw:
+        return []
+    out: list[str] = []
+    for part in raw.split(","):
+        part = part.strip().lstrip("@").lower()
+        if part:
+            out.append(part)
+    return out
 
 
 def _env_any(*names: str, default: str = "") -> str:
@@ -238,6 +257,10 @@ def load_config_from_env() -> GlobalConfig:
         retry_max=retry,
         retry_base_delay=float(os.environ.get("EMAIL_RETRY_DELAY", "1")),
         attachment_allowed_dirs=_parse_dir_list(os.environ.get("EMAIL_ATTACHMENT_DIRS")),
+        max_attachment_bytes=int(os.environ.get("EMAIL_MAX_ATTACHMENT_BYTES",
+                                                str(5 * 1024 * 1024))),
+        allowed_recipient_domains=_parse_domain_list(
+            os.environ.get("EMAIL_ALLOWED_RECIPIENT_DOMAINS")),
     )
 
 
@@ -490,7 +513,26 @@ async def _retry(action, *, max_retries: int, base_delay: float, what: str) -> A
     raise last_exc
 
 
+def _enforce_recipient_allowlist(recipients: list[str]) -> None:
+    """收件人網域白名單開關：CONFIG.allowed_recipient_domains 非空時，每個收件人
+    網域都必須在清單內，否則 raise PermissionError（防被誘導對外亂寄）。空 = 不檢查。"""
+    allowed = CONFIG.allowed_recipient_domains
+    if not allowed:
+        return
+    bad = []
+    for addr in recipients:
+        dom = addr.rsplit("@", 1)[-1].lower() if "@" in addr else ""
+        if dom not in allowed:
+            bad.append(addr)
+    if bad:
+        raise PermissionError(
+            f"收件人網域不在白名單內：{bad}（允許：{allowed}）。"
+            "此為 EMAIL_ALLOWED_RECIPIENT_DOMAINS 設定的寄件保護"
+        )
+
+
 def _send_via_smtp(cfg: SMTPConfig, msg: EmailMessage, recipients: list[str]) -> dict[str, Any]:
+    _enforce_recipient_allowlist(recipients)
     with _build_smtp_client(cfg) as client:
         # send_message 會自己處理 Bcc（不會出現在 header）
         refused = client.send_message(msg, to_addrs=recipients)
@@ -539,6 +581,16 @@ def _decode_header(raw: str) -> str:
         else:
             decoded.append(value)
     return "".join(decoded)
+
+
+def _date_iso(raw: str) -> str:
+    """把 Date header 轉成 ISO 8601（含時區）方便模型比對；parse 失敗回空字串。"""
+    if not raw:
+        return ""
+    try:
+        return parsedate_to_datetime(raw).isoformat()
+    except (TypeError, ValueError):
+        return ""
 
 
 def _utf7_encode(name: str) -> str:
@@ -753,6 +805,7 @@ def _fetch_headers(conn: imaplib.IMAP4, mids) -> list[dict[str, Any]]:
             "to": _decode_header(msg.get("To", "")),
             "subject": _decode_header(msg.get("Subject", "")),
             "date": msg.get("Date", ""),
+            "date_iso": _date_iso(msg.get("Date", "")),
             "flags": flags_str,
         })
     return results
@@ -801,6 +854,7 @@ def _imap_get_message(folder: str, uid: str, peek: bool = True) -> dict[str, Any
             "reply_to": _decode_header(msg.get("Reply-To", "")),
             "subject": _decode_header(msg.get("Subject", "")),
             "date": msg.get("Date", ""),
+            "date_iso": _date_iso(msg.get("Date", "")),
             "message_id": msg.get("Message-ID", ""),
             "references": msg.get("References", ""),
             "body_text": body_text,
@@ -810,8 +864,14 @@ def _imap_get_message(folder: str, uid: str, peek: bool = True) -> dict[str, Any
 
 
 def _imap_get_attachment(folder: str, uid: str, filename: Optional[str] = None,
-                         index: Optional[int] = None) -> dict[str, Any]:
-    """抓單封信裡某個附件的實際內容（base64）。以 filename 或 index 指定其一。"""
+                         index: Optional[int] = None,
+                         max_bytes: Optional[int] = None) -> dict[str, Any]:
+    """抓單封信裡某個附件的實際內容（base64）。以 filename 或 index 指定其一。
+
+    超過 max_bytes（未給則用 CONFIG.max_attachment_bytes）的附件不回傳內容、
+    只回 metadata 並標 too_large=true，避免大附件撐爆模型 context / 記憶體。
+    """
+    cap = max_bytes if max_bytes is not None else CONFIG.max_attachment_bytes
     with IMAPClient(_imap_cfg()) as conn:
         _imap_select(conn, folder, readonly=True)
         status, data = conn.uid("fetch", uid, "(BODY.PEEK[])")
@@ -842,13 +902,50 @@ def _imap_get_attachment(folder: str, uid: str, filename: Optional[str] = None,
             target = found[i]
         fn, part = target
         payload = part.get_payload(decode=True) or b""
-        return {
+        out = {
             "uid": uid,
             "filename": fn,
             "mime_type": part.get_content_type(),
             "size": len(payload),
-            "content_base64": base64.b64encode(payload).decode("ascii"),
         }
+        if cap and len(payload) > cap:
+            out["too_large"] = True
+            out["max_bytes"] = cap
+            out["note"] = (f"附件 {len(payload)} bytes 超過上限 {cap} bytes，未回傳內容；"
+                           "如仍要取回請提高 max_bytes")
+            return out
+        out["content_base64"] = base64.b64encode(payload).decode("ascii")
+        return out
+
+
+def _imap_append_draft(folder: str, msg: EmailMessage) -> dict[str, Any]:
+    """把一封信 APPEND 進草稿匣（帶 \\Draft flag）。回傳 uid（若 server 支援 APPENDUID）。"""
+    with IMAPClient(_imap_cfg()) as conn:
+        mbox = _imap_mailbox(folder)
+        raw = msg.as_bytes(policy=email.policy.SMTP)
+        status, data = conn.append(mbox, "(\\Draft)", None, raw)
+        if status != "OK":
+            raise RuntimeError(f"存草稿到 {folder} 失敗：{data!r}")
+        # APPENDUID 回應形如 [APPENDUID <uidvalidity> <uid>]
+        uid = None
+        blob = " ".join(
+            x.decode("utf-8", "replace") if isinstance(x, (bytes, bytearray)) else str(x)
+            for x in (data or []) if x
+        )
+        m = re.search(r"APPENDUID\s+\d+\s+(\d+)", blob)
+        if m:
+            uid = m.group(1)
+        return {"folder": folder, "uid": uid, "saved": True}
+
+
+def _imap_fetch_raw(folder: str, uid: str) -> bytes:
+    """抓某封信的原始 bytes（給 send_draft / forward 重建用）。"""
+    with IMAPClient(_imap_cfg()) as conn:
+        _imap_select(conn, folder, readonly=True)
+        status, data = conn.uid("fetch", uid, "(BODY.PEEK[])")
+        if status != "OK" or not data or data[0] is None:
+            raise RuntimeError(f"fetch uid={uid} 失敗：{data!r}")
+        return data[0][1]
 
 
 def _imap_list_folders() -> list[str]:
@@ -1096,9 +1193,14 @@ def _imap_apply_rules(folder: str, limit: int, search: str,
                     marks.append((uid, a["mark"], a.get("add", True)))
 
     for dest, uids in moves.items():
-        r = _imap_move_messages(folder, uids, dest)
-        executed["moved"] += r["moved"]
-        executed["failed"] += r["failed"]
+        # 單一目的地失敗（如資料夾不存在）不該中斷整批：記進 failed，繼續其他規則
+        try:
+            r = _imap_move_messages(folder, uids, dest)
+            executed["moved"] += r["moved"]
+            executed["failed"] += r["failed"]
+        except Exception as exc:
+            executed["failed"] += uids
+            executed.setdefault("errors", []).append(f"move → {dest}: {exc}")
     if marks:
         with IMAPClient(_imap_cfg()) as conn:
             _imap_select(conn, folder, readonly=False)
@@ -1168,6 +1270,18 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "附件路徑白名單目錄。設定後 email_send 的 path 附件只能來自這些目錄底下，"
                             "用來防止任意本機檔案外洩。空 list 代表不限制。"
+                        ),
+                    },
+                    "max_attachment_bytes": {
+                        "type": "integer",
+                        "description": "email_get_attachment 單一附件回傳的大小上限（bytes）",
+                    },
+                    "allowed_recipient_domains": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "收件人網域白名單（開關）。非空時 send/reply/forward 只能寄到這些網域，"
+                            "防被誘導對外亂寄。空 list 代表關閉（不限制）。"
                         ),
                     },
                 },
@@ -1407,6 +1521,8 @@ async def list_tools() -> list[Tool]:
                     "uid": {"type": "string"},
                     "filename": {"type": "string", "description": "附件檔名（與 index 擇一）"},
                     "index": {"type": "integer", "description": "附件序號，0 起（與 filename 擇一，預設 0）"},
+                    "max_bytes": {"type": "integer",
+                                  "description": "本次回傳的大小上限（bytes），覆蓋伺服器預設；超過只回 metadata"},
                 },
             },
         ),
@@ -1444,6 +1560,80 @@ async def list_tools() -> list[Tool]:
                             },
                         },
                     },
+                },
+            },
+        ),
+        Tool(
+            name="email_forward",
+            description=(
+                "轉寄某封信：主旨自動加 Fwd:，內文附上原信抬頭與內容，"
+                "預設一併轉寄原附件（include_attachments=false 可關）。可加自己的 text/html。"
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["uid", "to"],
+                "properties": {
+                    "folder": {"type": "string", "default": "INBOX"},
+                    "uid": {"type": "string"},
+                    "to": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "cc": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "bcc": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "text": {"type": "string", "description": "轉寄時附加的說明（放在原信之前）"},
+                    "html": {"type": "string"},
+                    "include_attachments": {"type": "boolean", "default": True,
+                                            "description": "是否一併轉寄原信附件"},
+                    "from": {"type": "string", "description": "覆蓋預設 From"},
+                },
+            },
+        ),
+        Tool(
+            name="email_save_draft",
+            description=(
+                "把一封信存成草稿（IMAP APPEND 到草稿匣，帶 \\Draft flag），不寄出。"
+                "回傳草稿 uid（若 server 支援）。之後可用 email_send_draft 寄出。"
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["to"],
+                "properties": {
+                    "folder": {"type": "string", "default": "Drafts",
+                               "description": "草稿匣名稱（不同 server 可能為 Drafts / 草稿）"},
+                    "to": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "cc": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "bcc": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+                    "subject": {"type": "string"},
+                    "text": {"type": "string"},
+                    "html": {"type": "string"},
+                    "reply_to": {"type": "string"},
+                    "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                    "from": {"type": "string"},
+                    "attachments": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "content_base64": {"type": "string"},
+                                "filename": {"type": "string"},
+                                "mime_type": {"type": "string"},
+                            },
+                        },
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="email_send_draft",
+            description=(
+                "把草稿匣裡的某封草稿寄出，成功後從草稿匣刪除。"
+                "uid 取自 email_save_draft 回傳或 email_list_messages（folder=草稿匣）。"
+            ),
+            inputSchema={
+                "type": "object",
+                "required": ["uid"],
+                "properties": {
+                    "folder": {"type": "string", "default": "Drafts"},
+                    "uid": {"type": "string"},
                 },
             },
         ),
@@ -1488,13 +1678,18 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
             for k, v in (args["imap"] or {}).items():
                 if hasattr(CONFIG.imap, k):
                     setattr(CONFIG.imap, k, v)
-        for k in ("email_from", "retry_max", "retry_base_delay"):
+        for k in ("email_from", "retry_max", "retry_base_delay", "max_attachment_bytes"):
             if k in args:
                 setattr(CONFIG, k, args[k])
         if "attachment_allowed_dirs" in args:
             dirs = args["attachment_allowed_dirs"] or []
             CONFIG.attachment_allowed_dirs = [
                 str(Path(d).expanduser().resolve()) for d in dirs if d
+            ]
+        if "allowed_recipient_domains" in args:
+            doms = args["allowed_recipient_domains"] or []
+            CONFIG.allowed_recipient_domains = [
+                str(d).strip().lstrip("@").lower() for d in doms if d
             ]
         return _config_summary()
 
@@ -1636,7 +1831,11 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
         index = args.get("index")
         if index is not None:
             index = int(index)
-        return await asyncio.to_thread(_imap_get_attachment, folder, uid, filename, index)
+        max_bytes = args.get("max_bytes")
+        if max_bytes is not None:
+            max_bytes = int(max_bytes)
+        return await asyncio.to_thread(
+            _imap_get_attachment, folder, uid, filename, index, max_bytes)
 
     if name == "email_reply":
         folder = args.get("folder", "INBOX")
@@ -1709,6 +1908,115 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
             "elapsed_sec": round(time.time() - started, 3),
         }
 
+    if name == "email_forward":
+        folder = args.get("folder", "INBOX")
+        uid = str(args["uid"])
+        smtp_cfg = _smtp_cfg()
+        creds = _REQ_CREDS.get()
+        if MODE != "stdio" and creds is None:
+            raise PermissionError("遠端模式缺少本次請求的憑證，拒絕以伺服器身分寄信")
+        sender = args.get("from") or (
+            creds[0] if creds else (CONFIG.email_from or smtp_cfg.username))
+        if not sender:
+            raise RuntimeError("找不到寄件人：請設定 EMAIL_FROM 或 email_configure({email_from:...})")
+        to = _parse_addresses(args.get("to"))
+        cc = _parse_addresses(args.get("cc"))
+        bcc = _parse_addresses(args.get("bcc"))
+        if not to:
+            raise ValueError("至少要有一個收件人 (to)")
+
+        orig = await asyncio.to_thread(_imap_get_message, folder, uid, True)
+        raw = await asyncio.to_thread(_imap_fetch_raw, folder, uid)
+        subj = orig.get("subject") or ""
+        if not subj.lower().startswith(("fwd:", "fw:")):
+            subj = "Fwd: " + subj
+        header_block = (
+            f"\n\n---------- 轉寄的郵件 ----------\n"
+            f"寄件者：{orig.get('from', '')}\n收件者：{orig.get('to', '')}\n"
+            f"日期：{orig.get('date', '')}\n主旨：{orig.get('subject', '')}\n\n"
+        )
+        text = (args.get("text") or "") + header_block + (orig.get("body_text") or "")
+        html = args.get("html")
+
+        def _build_forward() -> EmailMessage:
+            fmsg = _build_message(
+                sender=sender, to=to, cc=cc, bcc=bcc, subject=subj,
+                text=text, html=html, reply_to=None, headers=None, attachments=None)
+            if args.get("include_attachments", True):
+                omsg = email.message_from_bytes(raw, policy=email.policy.default)
+                for part in omsg.walk():
+                    disp = part.get("Content-Disposition", "")
+                    fn = part.get_filename()
+                    if "attachment" in (disp or "").lower() or fn:
+                        payload = part.get_payload(decode=True) or b""
+                        maintype, _, subtype = part.get_content_type().partition("/")
+                        fmsg.add_attachment(payload, maintype=maintype,
+                                            subtype=subtype or "octet-stream",
+                                            filename=_decode_header(fn or "attachment.bin"))
+            return fmsg
+
+        msg = await asyncio.to_thread(_build_forward)
+        recipients = list(dict.fromkeys(to + cc + bcc))
+        started = time.time()
+        result = await _retry(
+            lambda: _send_via_smtp(smtp_cfg, msg, recipients),
+            max_retries=CONFIG.retry_max, base_delay=CONFIG.retry_base_delay,
+            what="SMTP forward",
+        )
+        return {
+            "ok": True, "forwarded_uid": uid, "to": to, "cc": cc, "bcc": bcc,
+            "subject": subj, "refused_addresses": result.get("refused", {}),
+            "elapsed_sec": round(time.time() - started, 3),
+        }
+
+    if name == "email_save_draft":
+        folder = args.get("folder", "Drafts")
+        smtp_cfg = _smtp_cfg()
+        creds = _REQ_CREDS.get()
+        sender = args.get("from") or (
+            creds[0] if creds else (CONFIG.email_from or smtp_cfg.username))
+        to = _parse_addresses(args.get("to"))
+        cc = _parse_addresses(args.get("cc"))
+        bcc = _parse_addresses(args.get("bcc"))
+        if not to:
+            raise ValueError("至少要有一個收件人 (to)")
+        msg = _build_message(
+            sender=sender or "", to=to, cc=cc, bcc=bcc,
+            subject=args.get("subject", ""), text=args.get("text"), html=args.get("html"),
+            reply_to=args.get("reply_to"), headers=args.get("headers"),
+            attachments=args.get("attachments"),
+        )
+        return await asyncio.to_thread(_imap_append_draft, folder, msg)
+
+    if name == "email_send_draft":
+        folder = args.get("folder", "Drafts")
+        uid = str(args["uid"])
+        smtp_cfg = _smtp_cfg()
+        creds = _REQ_CREDS.get()
+        if MODE != "stdio" and creds is None:
+            raise PermissionError("遠端模式缺少本次請求的憑證，拒絕以伺服器身分寄信")
+        raw = await asyncio.to_thread(_imap_fetch_raw, folder, uid)
+        draft = email.message_from_bytes(raw, policy=email.policy.default)
+        recipients = list(dict.fromkeys(
+            _parse_addresses(draft.get("To", "")) + _parse_addresses(draft.get("Cc", ""))
+            + _parse_addresses(draft.get("Bcc", ""))))
+        if not recipients:
+            raise ValueError("此草稿沒有收件人，無法寄出")
+        started = time.time()
+        result = await _retry(
+            lambda: _send_via_smtp(smtp_cfg, draft, recipients),
+            max_retries=CONFIG.retry_max, base_delay=CONFIG.retry_base_delay,
+            what="SMTP send_draft",
+        )
+        # 寄出後從草稿匣刪除（best-effort）
+        deleted = await asyncio.to_thread(_imap_delete, folder, [uid])
+        return {
+            "ok": True, "sent_from_draft": uid, "to": recipients,
+            "refused_addresses": result.get("refused", {}),
+            "draft_deleted": deleted.get("deleted", 0),
+            "elapsed_sec": round(time.time() - started, 3),
+        }
+
     raise ValueError(f"未知 tool: {name}")
 
 
@@ -1738,6 +2046,8 @@ def _config_summary() -> dict[str, Any]:
         "retry_max": CONFIG.retry_max,
         "retry_base_delay": CONFIG.retry_base_delay,
         "attachment_allowed_dirs": CONFIG.attachment_allowed_dirs,
+        "max_attachment_bytes": CONFIG.max_attachment_bytes,
+        "allowed_recipient_domains": CONFIG.allowed_recipient_domains,
     }
 
 

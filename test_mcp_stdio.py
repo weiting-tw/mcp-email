@@ -34,8 +34,9 @@ async def main() -> int:
             tools = await session.list_tools()
             names = [t.name for t in tools.tools]
             print(f"✅ list_tools — {len(names)} tools: {names}")
-            assert len(names) == 13, f"預期 13 個 tool，實際 {len(names)}"
-            for expect in ("email_get_attachment", "email_reply"):
+            assert len(names) == 16, f"預期 16 個 tool，實際 {len(names)}"
+            for expect in ("email_get_attachment", "email_reply", "email_forward",
+                           "email_save_draft", "email_send_draft"):
                 assert expect in names, f"缺少 tool: {expect}"
 
             prompts = await session.list_prompts()
