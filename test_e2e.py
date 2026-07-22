@@ -482,6 +482,13 @@ class _FakeIMAPConn:
     def subscribe(self, name):
         return "OK", [b"subscribed"]
 
+    def append(self, mbox, flags, date_time, message):
+        new_uid = str(max((int(u) for u in self._store), default=100) + 1)
+        self._store[new_uid] = message if isinstance(message, bytes) else message.encode()
+        self.flags[new_uid] = set((flags or "").strip("()").split())
+        self.folders.add(_unq(mbox))
+        return "OK", [f"[APPENDUID 1 {new_uid}]".encode()]
+
     def expunge(self):
         deleted = [u for u, fl in self.flags.items() if "\\Deleted" in fl]
         self.expunged.extend(deleted)
@@ -1007,6 +1014,123 @@ async def test_email_reply_quote_original():
         controller.stop()
 
 
+async def test_get_attachment_size_cap():
+    async def run():
+        # 低上限 → 只回 metadata、標 too_large、不含內容
+        out = await srv._dispatch("email_get_attachment",
+                                  {"folder": "INBOX", "uid": "101", "max_bytes": 3})
+        assert out.get("too_large") is True
+        assert "content_base64" not in out
+        assert out["size"] == len(b"file data")
+        # 高上限 → 正常回內容
+        out2 = await srv._dispatch("email_get_attachment",
+                                   {"folder": "INBOX", "uid": "101", "max_bytes": 10_000})
+        assert "content_base64" in out2
+    await _with_fake_imap(run)
+    print("✅ test_get_attachment_size_cap PASS")
+
+
+async def test_recipient_allowlist():
+    controller, handler = _start_smtpd(8044)
+    saved = srv.CONFIG.allowed_recipient_domains
+    try:
+        await _configure(8044)
+        srv.CONFIG.allowed_recipient_domains = ["example.com"]
+        # 白名單外 → 擋
+        try:
+            await srv._dispatch("email_send",
+                                {"to": "x@evil.com", "subject": "s", "text": "t"})
+            assert False, "白名單外收件人應被擋"
+        except PermissionError:
+            pass
+        # 白名單內 → 過
+        r = await srv._dispatch("email_send",
+                                {"to": "ok@example.com", "subject": "s", "text": "t"})
+        assert r["ok"]
+        print("✅ test_recipient_allowlist PASS")
+    finally:
+        srv.CONFIG.allowed_recipient_domains = saved
+        controller.stop()
+
+
+async def test_date_iso_present():
+    async def run():
+        lst = await srv._dispatch("email_list_messages", {"folder": "INBOX", "limit": 10})
+        assert all("date_iso" in m for m in lst["messages"])
+        got = await srv._dispatch("email_get_message", {"folder": "INBOX", "uid": "101"})
+        assert got["date_iso"] == "2026-06-12T10:00:00+08:00"
+    await _with_fake_imap(run)
+    print("✅ test_date_iso_present PASS")
+
+
+async def test_email_forward():
+    controller, handler = _start_smtpd(8045)
+
+    async def run():
+        await _configure(8045)
+        out = await srv._dispatch("email_forward", {
+            "folder": "INBOX", "uid": "101",
+            "to": "carol@example.com", "text": "請參考這封。",
+        })
+        assert out["ok"] and out["subject"] == "Fwd: 測試主旨"
+        msg = handler.messages[0]
+        assert msg["Subject"] == "Fwd: 測試主旨"
+        assert msg["To"] == "carol@example.com"
+        body = msg.get_body(preferencelist=("plain",)).get_content()
+        assert "請參考這封。" in body and "轉寄的郵件" in body and "純文字 body" in body
+        # 原附件 doc.bin 一併轉寄
+        atts = [p.get_filename() for p in msg.walk() if p.get_filename()]
+        assert "doc.bin" in atts
+
+    try:
+        await _with_fake_imap(run)
+        print("✅ test_email_forward PASS")
+    finally:
+        controller.stop()
+
+
+async def test_save_and_send_draft():
+    controller, handler = _start_smtpd(8046)
+    # 草稿要跨多次 IMAPClient 呼叫（save→fetch→delete）持續存在，用同一個 conn 實例
+    shared = _build_fake_store()
+
+    async def run():
+        await _configure(8046)
+        saved = await srv._dispatch("email_save_draft", {
+            "folder": "Drafts", "to": "dave@example.com",
+            "subject": "草稿測試", "text": "草稿內容",
+        })
+        assert saved["saved"] and saved["uid"]
+        assert not handler.messages, "存草稿不該寄出"
+        uid = saved["uid"]
+        sent = await srv._dispatch("email_send_draft", {"folder": "Drafts", "uid": uid})
+        assert sent["ok"] and sent["to"] == ["dave@example.com"]
+        assert sent["draft_deleted"] == 1
+        assert handler.messages and handler.messages[0]["Subject"] == "草稿測試"
+
+    try:
+        await _with_fake_imap(run, factory=lambda: shared)
+        print("✅ test_save_and_send_draft PASS")
+    finally:
+        controller.stop()
+
+
+async def test_apply_rules_move_missing_dest_no_abort():
+    """apply_rules 執行時，move 目的地不存在不該中斷整批，記入 failed/errors。"""
+    async def run():
+        out = await srv._dispatch("email_apply_rules", {
+            "folder": "INBOX", "dry_run": False,
+            "rules": [{"name": "r1", "subject_contains_any": ["主旨", "第二"],
+                       "action": {"move_to": "不存在的資料夾"}}],
+        })
+        assert "executed" in out
+        assert out["executed"]["moved"] == 0
+        assert out["executed"]["failed"]  # 有記錄失敗
+        assert out["executed"].get("errors")  # 有錯誤訊息，但沒 raise
+    await _with_fake_imap(run)
+    print("✅ test_apply_rules_move_missing_dest_no_abort PASS")
+
+
 async def main():
     tests = [
         test_simple_text,
@@ -1057,6 +1181,13 @@ async def main():
         test_email_reply_threading,
         test_email_reply_all_dedups_and_drops_self,
         test_email_reply_quote_original,
+        # 0.5.0：附件上限、白名單、ISO 時間、轉寄、草稿、apply_rules 部分失敗
+        test_get_attachment_size_cap,
+        test_recipient_allowlist,
+        test_date_iso_present,
+        test_email_forward,
+        test_save_and_send_draft,
+        test_apply_rules_move_missing_dest_no_abort,
     ]
     passed = 0
     for t in tests:

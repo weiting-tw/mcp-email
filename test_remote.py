@@ -162,6 +162,18 @@ def test_attachment_whitelist_symlink_escape(tmp_path):
         srv.CONFIG.attachment_allowed_dirs = old
 
 
+def test_recipient_allowlist_enforced(monkeypatch):
+    """收件人網域白名單開關：設定後對外寄信到白名單外一律擋（防被誘導亂寄）。"""
+    monkeypatch.setattr(srv.CONFIG, "allowed_recipient_domains", ["corp.tw"])
+    with pytest.raises(PermissionError):
+        srv._enforce_recipient_allowlist(["a@corp.tw", "b@outside.com"])
+    # 全部在白名單 → 通過（不 raise）
+    srv._enforce_recipient_allowlist(["a@corp.tw", "b@corp.tw"])
+    # 空清單 = 關閉 → 一律放行
+    monkeypatch.setattr(srv.CONFIG, "allowed_recipient_domains", [])
+    srv._enforce_recipient_allowlist(["anyone@anywhere.com"])
+
+
 def test_email_send_remote_uses_request_creds(monkeypatch):
     """遠端模式：SMTP 登入帳密與預設 From 都來自該請求的憑證。"""
     sent = {}

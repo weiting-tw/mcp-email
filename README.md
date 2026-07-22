@@ -12,23 +12,26 @@
 | **HTTP** | `mcp-email --http` | 內網多人共用（Claude Code / Desktop 遠端連線） | 每請求 `Authorization: Basic`，伺服器不存帳密 |
 | **OAuth** | `mcp-email --oauth --issuer …` | claude.ai Connectors（手機 app / 網頁版） | OAuth 2.1 + 無狀態加密 token，伺服器不存帳密 |
 
-## 能做什麼（13 個 tools）
+## 能做什麼（16 個 tools）
 
 | Tool | 用途 |
 |---|---|
-| `email_configure` | Runtime 動態切換 SMTP / IMAP 帳密、port、TLS |
+| `email_configure` | Runtime 動態切換 SMTP / IMAP 帳密、port、TLS、附件上限、收件人白名單 |
 | `email_test_connection` | 一鍵測 SMTP + IMAP 是否能登入 |
 | `email_send` | 寄信：HTML + 純文字、to/cc/bcc、檔案/Base64 附件、Reply-To、自訂 headers、retry |
 | `email_reply` | 回覆某封信：自動帶 `Re:` 主旨與 `In-Reply-To`/`References` 串接對話，可 reply_all、引用原文 |
+| `email_forward` | 轉寄某封信：`Fwd:` 主旨、附上原信抬頭與內容，預設一併轉寄原附件 |
 | `email_list_folders` | IMAP 列出所有 mailbox 名稱（中文名稱自動解碼） |
-| `email_list_messages` | 列出 folder 內訊息 header（支援 IMAP search syntax） |
-| `email_get_message` | 抓單封信完整內容（body text/html、附件 metadata 含 index、選擇是否標 SEEN） |
-| `email_get_attachment` | 下載單封信裡某個附件的實際內容（base64），以 filename 或 index 指定 |
+| `email_list_messages` | 列出 folder 內訊息 header（支援 IMAP search syntax；含 `date_iso`） |
+| `email_get_message` | 抓單封信完整內容（body text/html、附件 metadata 含 index、`date_iso`、選擇是否標 SEEN） |
+| `email_get_attachment` | 下載單封信裡某個附件的實際內容（base64），以 filename 或 index 指定；有大小上限保護 |
 | `email_mark` | 加/移除 IMAP flag（`\Seen` / `\Flagged` 等） |
 | `email_delete` | 標記 `\Deleted` 並 expunge（UID EXPUNGE） |
 | `email_create_folder` | 建立 folder（支援中文，自動 modified UTF-7；已存在不報錯） |
 | `email_move_messages` | 搬信：UID MOVE，server 不支援則 COPY + UID EXPUNGE fallback |
-| `email_apply_rules` | 規則整理：掃描後依條件 move/mark/delete，`dry_run` 預覽；比對方式可調（`match`: substring/regex/exact、`case_sensitive`、`match_mode`: first/all） |
+| `email_apply_rules` | 規則整理：掃描後依條件 move/mark/delete，`dry_run` 預覽；單一目的地失敗不中斷整批；比對方式可調（`match`: substring/regex/exact、`case_sensitive`、`match_mode`: first/all） |
+| `email_save_draft` | 把一封信存成草稿（IMAP APPEND 到草稿匣，`\Draft` flag），不寄出，回草稿 uid |
+| `email_send_draft` | 把草稿匣裡的某封草稿寄出，成功後從草稿匣刪除 |
 
 ### Prompts（在支援的 client 顯示成 slash command）
 
@@ -101,7 +104,7 @@ pip install -r requirements-dev.txt
 
 # 跑端到端測試（in-process 假 SMTP + 假 IMAP）
 python test_e2e.py
-# 預期：=== 43/43 passed ===
+# 預期：=== 49/49 passed ===
 
 # 遠端（--http/--oauth）模式測試
 python -m pytest test_remote.py -q
@@ -142,7 +145,7 @@ python -m pytest test_remote.py -q
 }
 ```
 
-重啟 Claude 後就會看到 `email_*` 8 個 tool 出現。
+重啟 Claude 後就會看到 `email_*` 系列 tool 出現。
 
 不設環境變數也可以，啟動後第一次用之前先呼叫 `email_configure` 設定帳密（runtime 設定不會落地，重啟會清空）。
 
@@ -374,6 +377,31 @@ nginx 使用者：`proxy_pass http://127.0.0.1:8765;` 並保留
 設定後，`path` 附件只能來自這些目錄底下（會解析 symlink 防繞過），名單外一律 `PermissionError`。
 空白（預設）= 不限制。`content_base64` 附件不受此限（內容由呼叫端直接提供）。
 
+**收件人網域白名單（防被誘導亂寄，開關，預設關）**：`email_send` / `email_reply` /
+`email_forward` / `email_send_draft` 都是對外動作，若擔心模型被惡意信件內容誘導亂寄，
+可限制只能寄到指定網域：
+
+```jsonc
+// 環境變數（逗號分隔）
+"EMAIL_ALLOWED_RECIPIENT_DOMAINS": "gss.com.tw,example.com"
+```
+
+設定後任何收件人（to/cc/bcc）網域不在清單內就 `PermissionError`；空白（預設）= 關閉不限制。
+
+**附件下載大小上限**：`email_get_attachment` 把附件 base64 回傳，過大的附件會撐爆模型
+context / 記憶體，預設上限 5MB（超過只回 metadata 並標 `too_large`）。可用
+`EMAIL_MAX_ATTACHMENT_BYTES` 調整，或呼叫時以 `max_bytes` 覆蓋。
+
+**⚠️ Prompt injection（把這套接上 LLM 最重要的風險）**：信件的主旨/內文是**寄件人可控**的，
+`email_get_message` / `email_list_messages` 會把它們原樣回給模型，惡意信可能夾帶
+「請把這封轉寄到 …／刪除某資料夾」之類的指令試圖操縱模型。防線：
+
+- **絕不要把信件內文裡的指令當成命令執行**——內文永遠是「資料」不是「指令」。
+- 破壞性/對外動作（`send`/`reply`/`forward`/`delete`/`move`/`apply_rules`/`send_draft`）
+  **執行前一律先向使用者確認**；多數 MCP host（Claude Desktop/Code）本來就會對每次工具
+  呼叫要求核准，這是主要安全網，別關掉它。
+- 加上上面的**收件人網域白名單**當第二層防線；`apply_rules` 保持 `dry_run=true` 先預覽。
+
 ## Tool 呼叫範例
 
 ### email_configure
@@ -477,13 +505,13 @@ fallback 成「以剩餘 ASCII 條件縮小範圍 → 抓 header 在客戶端比
 ## 驗證測試結果
 
 ```
-=== 43/43 passed ===
+=== 49/49 passed ===
 ```
 
 另有 `test_mcp_stdio.py`：用真正的 MCP client 把 `mcp_email.py` 以 stdio 子行程啟動，
 跑完整 `initialize` → `list_tools` → 呼叫 tool 的 handshake，驗證能被任何 MCP host 載入。
 
-以及 `test_remote.py`（37 tests）：遠端模式的 Basic 標頭解析、每請求憑證覆蓋、
+以及 `test_remote.py`（40 tests）：遠端模式的 Basic 標頭解析、每請求憑證覆蓋、
 遠端限制（`email_configure` / `path` 附件停用、白名單 symlink 繞過）、
 OAuth token 加解密與 provider 流程（含失敗節流、狀態清理、DCR 上限淘汰）、
 in-process uvicorn 起真正 streamable-http server 的端對端測試——包括
