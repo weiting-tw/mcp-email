@@ -40,7 +40,10 @@
 
 ### 最快：uvx / pip（從 PyPI）
 
-已發佈到 PyPI，用 [uv](https://docs.astral.sh/uv/) 免手動建環境，首次執行自動抓套件：
+> ⚠️ 尚未發佈到 PyPI（首次發佈流程見文末〈發佈到 PyPI〉）。發佈後即可用
+> 下列方式安裝；在那之前請用下一節「從原始碼」。
+
+發佈後，用 [uv](https://docs.astral.sh/uv/) 免手動建環境，首次執行自動抓套件：
 
 ```bash
 uvx mcp-email          # 直接跑（uv 會自動安裝到隔離環境）
