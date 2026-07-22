@@ -34,3 +34,6 @@ jobs:
 
       - name: Run MCP stdio integration test
         run: python test_mcp_stdio.py
+
+      - name: Run remote (http/oauth) and i18n search tests
+        run: python -m pytest test_remote.py test_search_i18n.py -q
