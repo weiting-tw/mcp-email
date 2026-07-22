@@ -286,6 +286,65 @@ def test_provider_refresh_flow(tmp_path):
     assert at2.email_user == "user@x.tw" and at2.email_pass == "pw"
 
 
+# ─── 同意畫面（consent screen）與 XSS escaping ──────────────────────────────
+def _provider(tmp_path):
+    provider, _ = oa.create(
+        "https://mail-mcp.example.com",
+        key_path=str(tmp_path / "k"), clients_path=str(tmp_path / "c.json"))
+    return provider
+
+
+def test_client_display_prefers_name_and_redirect_host(tmp_path):
+    provider = _provider(tmp_path)
+    provider._clients["cid1"] = {"client_id": "cid1", "client_name": "Claude"}
+    entry = {"cid": "cid1",
+             "params": SimpleNamespace(redirect_uri="https://claude.ai/api/mcp/cb")}
+    name, host = provider._client_display(entry)
+    assert name == "Claude" and host == "claude.ai"
+
+
+def test_client_display_falls_back_to_client_id(tmp_path):
+    provider = _provider(tmp_path)
+    entry = {"cid": "unknown-cid", "params": SimpleNamespace(redirect_uri="")}
+    name, host = provider._client_display(entry)
+    assert name == "unknown-cid"
+
+
+def test_login_html_renders_consent_banner(tmp_path):
+    provider = _provider(tmp_path)
+    page = provider._login_html("tok", client_name="Claude", redirect_host="claude.ai")
+    assert "要求連接你的信箱" in page
+    assert "Claude" in page and "claude.ai" in page
+    assert "只有在你認得這個應用程式與目的地時才繼續" in page
+
+
+def test_login_html_escapes_client_name_xss(tmp_path):
+    """client_name 是註冊時外部輸入，必須 escape，不能形成 <script>。"""
+    provider = _provider(tmp_path)
+    payload = '<script>alert(1)</script>'
+    page = provider._login_html("tok", client_name=payload,
+                                redirect_host='evil"><img src=x onerror=alert(1)>')
+    assert "<script>alert(1)</script>" not in page
+    assert "&lt;script&gt;" in page
+    assert "onerror=alert(1)>" not in page  # 屬性突破也被 escape
+
+
+def test_login_html_no_consent_when_no_client_info(tmp_path):
+    provider = _provider(tmp_path)
+    page = provider._login_html("tok")
+    assert 'class="consent"' not in page
+
+
+def test_all_pages_share_style(tmp_path):
+    """三頁都套用共用 _PAGE_STYLE（同一份 CSS，不再各自複製）。"""
+    provider = _provider(tmp_path)
+    provider.issuer = "https://mail-mcp.example.com"
+    for page in (provider._login_html("t"), provider._completed_html(),
+                 provider._index_html()):
+        assert ".consent" in page and ".box" in page  # 共用樣式標記
+        assert page.count("<style>") == 1
+
+
 # ─── HTTP 傳輸端對端（in-process uvicorn + mcp client）────────────────────
 def _free_port() -> int:
     with socket.socket() as s:
@@ -492,6 +551,9 @@ def test_oauth_full_flow_end_to_end(oauth_server, monkeypatch):
 
             page = await c.get(base + "/login", params={"txn": txn})
             assert page.status_code == 200 and 'name="txn"' in page.text
+            # 同意橫幅要顯示本次授權的 client 名稱與送達網域（防釣魚）
+            assert "要求連接你的信箱" in page.text
+            assert "localhost:19999" in page.text  # redirect_uri 的 host
 
             r = await c.post(base + "/login",
                              data={"txn": txn, "user": "dave@x.tw", "password": "bad"})

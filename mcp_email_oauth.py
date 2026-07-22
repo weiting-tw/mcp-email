@@ -17,6 +17,7 @@ mcp-email OAuth bridge — 讓 claude.ai Connectors（手機/網頁版）能連 
 
 需要：pip install cryptography（其餘同 MCP server）。
 """
+import html
 import json
 import os
 import secrets
@@ -72,6 +73,29 @@ _SEC_HEADERS = {             # /login 頁安全標頭：防點擊劫持、不快
     "Cache-Control": "no-store",
     "Referrer-Policy": "no-referrer",
 }
+
+# 三個網頁（login / completed / index）共用同一套樣式，避免各頁重複維護 CSS。
+_PAGE_STYLE = """
+body{font-family:-apple-system,"PingFang TC",sans-serif;background:#f1f5f9;
+display:flex;justify-content:center;padding-top:8vh;margin:0}
+.box{background:#fff;padding:28px;border-radius:12px;box-shadow:0 4px 16px rgba(0,0,0,.08);
+width:340px;box-sizing:border-box}
+h1{font-size:17px;margin:0 0 6px}
+p,li{font-size:13px;color:#475569;margin:6px 0}
+ol{padding-left:18px;margin:6px 0}
+input{width:100%;box-sizing:border-box;padding:8px;margin:6px 0;border:1px solid #cbd5e1;
+border-radius:6px;font-size:14px}
+button{width:100%;padding:10px;margin-top:10px;background:#2563eb;color:#fff;border:none;
+border-radius:8px;font-size:14px;cursor:pointer}
+button:disabled{background:#94a3b8;cursor:progress}
+code{background:#f1f5f9;border-radius:4px;padding:1px 5px;font-size:12px;word-break:break-all}
+.err{color:#dc2626;font-size:13px;margin:6px 0}
+.note{font-size:11px;color:#94a3b8}
+.consent{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:12px;margin:10px 0}
+.consent .dest{margin:4px 0}
+.consent .warn{color:#b45309;font-size:12px;margin:6px 0 0}
+.center{text-align:center}
+"""
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_KEY_PATH = os.environ.get("EMAIL_BRIDGE_KEY_FILE") or os.path.join(ROOT, ".bridge-key")
@@ -244,70 +268,82 @@ class EmailOAuthProvider:
                           "fail2ban 日誌功能停用（檢查掛載目錄對執行 UID 的寫入權限）",
                           file=sys.stderr)
 
-    def _login_html(self, txn: str, error: str = "") -> str:
-        err = f'<p class="err">{error}</p>' if error else ""
-        hint = f"（可省略 @{DEFAULT_DOMAIN}）" if DEFAULT_DOMAIN else ""
-        return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>mcp-email 信箱授權</title>
-<style>body{{font-family:-apple-system,"PingFang TC",sans-serif;background:#f1f5f9;display:flex;
-justify-content:center;padding-top:8vh;margin:0}}form{{background:#fff;padding:28px;border-radius:12px;
-box-shadow:0 4px 16px rgba(0,0,0,.08);width:320px}}h1{{font-size:17px;margin:0 0 6px}}
-p{{font-size:13px;color:#475569;margin:6px 0}}input{{width:100%;box-sizing:border-box;padding:8px;
-margin:6px 0;border:1px solid #cbd5e1;border-radius:6px;font-size:14px}}
-button{{width:100%;padding:10px;margin-top:10px;background:#2563eb;color:#fff;border:none;
-border-radius:8px;font-size:14px;cursor:pointer}}button:disabled{{background:#94a3b8;cursor:progress}}
-.err{{color:#dc2626}}.note{{font-size:11px;color:#94a3b8}}</style></head><body>
-<form method="post" action="/login">
-<h1>連接你的信箱</h1>
-<p>請輸入信箱帳號與密碼（信箱服務若支援，<b>建議使用應用程式專用密碼</b>）。</p>
-{err}
-<input type="hidden" name="txn" value="{txn}">
-<input name="user" placeholder="帳號{hint}" autocomplete="username" required>
-<input name="password" type="password" placeholder="密碼（建議應用程式專用密碼）" autocomplete="current-password" required>
-<button id="sb" type="submit">驗證並授權</button>
-<p class="note">憑證只用來即時以 IMAP 驗證並加密封入你的存取權杖，伺服器不儲存。
-撤銷方式：更改密碼或撤銷該應用程式專用密碼。</p>
-<p class="note">mcp-email v{mcp_email.__version__} · <a href="{SOURCE_URL}" target="_blank" rel="noopener" style="color:#94a3b8">原始碼</a></p>
-</form>
-<script>
-document.querySelector("form").addEventListener("submit", function () {{
-  var b = document.getElementById("sb");
-  b.disabled = true; b.textContent = "驗證中，請稍候…（正在連線信箱伺服器）";
-}});
-</script></body></html>"""
+    def _document(self, body: str, title: str) -> str:
+        """把頁面內容包進共用的 doctype/head（含 _PAGE_STYLE）外殼。"""
+        return ('<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                f"<title>{html.escape(title)}</title><style>{_PAGE_STYLE}</style>"
+                f"</head><body>{body}</body></html>")
+
+    def _footer(self) -> str:
+        return (f'<p class="note">mcp-email v{mcp_email.__version__} · '
+                f'<a href="{SOURCE_URL}" target="_blank" rel="noopener" '
+                'style="color:#94a3b8">原始碼</a></p>')
+
+    def _client_display(self, entry: dict) -> tuple[str, str]:
+        """回 (應用程式名稱, 授權碼將送達的網域)，供登入頁的同意橫幅顯示。
+        名稱是 client 註冊時自填的（不可盡信）；真正的信任訊號是「送達網域」
+        ——釣魚攻擊會把 redirect_uri 指向自己的網域，使用者認不得就該中止。"""
+        info = self._clients.get(entry.get("cid", ""), {})
+        name = info.get("client_name") or info.get("client_uri") or entry.get("cid", "")
+        params = entry.get("params")
+        redirect = str(getattr(params, "redirect_uri", "") or "")
+        return name, (urlparse(redirect).netloc or redirect)
+
+    def _login_html(self, txn: str, error: str = "",
+                    client_name: str = "", redirect_host: str = "") -> str:
+        err = f'<p class="err">{html.escape(error)}</p>' if error else ""
+        hint = f"（可省略 @{html.escape(DEFAULT_DOMAIN)}）" if DEFAULT_DOMAIN else ""
+        # 同意橫幅：client_name / redirect_host 皆為註冊時的外部輸入，一律 escape 防 XSS
+        consent = ""
+        if client_name or redirect_host:
+            consent = (
+                '<div class="consent">'
+                f'<p>應用程式 <b>{html.escape(client_name) or "（未提供名稱）"}</b> '
+                '要求連接你的信箱。</p>'
+                f'<p class="dest">授權後存取權將送往：<b>{html.escape(redirect_host) or "（未知）"}</b></p>'
+                '<p class="warn">只有在你認得這個應用程式與目的地時才繼續；'
+                '若不是你主動發起的連接，請直接關閉此頁。</p></div>'
+            )
+        body = (
+            '<form class="box" method="post" action="/login">'
+            '<h1>連接你的信箱</h1>'
+            f'{consent}'
+            '<p>請輸入信箱帳號與密碼（信箱服務若支援，<b>建議使用應用程式專用密碼</b>）。</p>'
+            f'{err}'
+            f'<input type="hidden" name="txn" value="{html.escape(txn)}">'
+            f'<input name="user" placeholder="帳號{hint}" autocomplete="username" required>'
+            '<input name="password" type="password" placeholder="密碼（建議應用程式專用密碼）" '
+            'autocomplete="current-password" required>'
+            '<button id="sb" type="submit">驗證並授權</button>'
+            '<p class="note">憑證只用來即時以 IMAP 驗證並加密封入你的存取權杖，伺服器不儲存。'
+            '撤銷方式：更改密碼或撤銷該應用程式專用密碼。</p>'
+            f'{self._footer()}</form>'
+            '<script>document.querySelector("form").addEventListener("submit",function(){'
+            'var b=document.getElementById("sb");b.disabled=true;'
+            'b.textContent="驗證中，請稍候…（正在連線信箱伺服器）";});</script>'
+        )
+        return self._document(body, "mcp-email 信箱授權")
 
     def _completed_html(self) -> str:
-        return """<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>授權完成</title>
-<style>body{font-family:-apple-system,"PingFang TC",sans-serif;background:#f1f5f9;display:flex;
-justify-content:center;padding-top:8vh;margin:0}.card{background:#fff;padding:28px;border-radius:12px;
-box-shadow:0 4px 16px rgba(0,0,0,.08);width:320px;text-align:center}h1{font-size:18px;margin:0 0 8px}
-p{font-size:13px;color:#475569}</style></head><body>
-<div class="card"><h1>✅ 授權完成</h1>
-<p>信箱已成功連接，可以關閉此視窗並回到應用程式。</p></div></body></html>"""
+        body = ('<div class="box center"><h1>✅ 授權完成</h1>'
+                '<p>信箱已成功連接，可以關閉此視窗並回到應用程式。</p></div>')
+        return self._document(body, "授權完成")
 
     def _index_html(self) -> str:
-        mcp_url = getattr(self, "issuer", "") + "/mcp"
-        return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>mcp-email MCP server</title>
-<style>body{{font-family:-apple-system,"PingFang TC",sans-serif;background:#f1f5f9;display:flex;
-justify-content:center;padding-top:8vh;margin:0}}.card{{background:#fff;padding:28px;border-radius:12px;
-box-shadow:0 4px 16px rgba(0,0,0,.08);width:360px}}h1{{font-size:17px;margin:0 0 6px}}
-p,li{{font-size:13px;color:#475569;margin:6px 0}}ol{{padding-left:18px;margin:6px 0}}
-code{{background:#f1f5f9;border-radius:4px;padding:1px 5px;font-size:12px;word-break:break-all}}
-.note{{font-size:11px;color:#94a3b8}}</style></head><body>
-<div class="card"><h1>📮 mcp-email MCP server</h1>
-<p>讓 Claude 等 AI 助理收發與整理你的信箱（IMAP/SMTP）。</p>
-<p><b>連接方式（claude.ai）：</b></p>
-<ol>
-<li>設定 → 連接器（Connectors）→ 新增自訂連接器</li>
-<li>貼上 <code>{mcp_url}</code></li>
-<li>授權時輸入信箱帳號＋密碼（建議使用應用程式專用密碼）</li>
-</ol>
-<p class="note">憑證只用來即時以 IMAP 驗證並加密封入你的存取權杖，伺服器不儲存；
-撤銷方式：更改密碼或撤銷該應用程式專用密碼。</p>
-<p class="note">mcp-email v{mcp_email.__version__} · <a href="{SOURCE_URL}" target="_blank" rel="noopener" style="color:#94a3b8">原始碼</a></p>
-</div></body></html>"""
+        mcp_url = html.escape(getattr(self, "issuer", "") + "/mcp")
+        body = (
+            '<div class="box"><h1>📮 mcp-email MCP server</h1>'
+            '<p>讓 Claude 等 AI 助理收發與整理你的信箱（IMAP/SMTP）。</p>'
+            '<p><b>連接方式（claude.ai）：</b></p><ol>'
+            '<li>設定 → 連接器（Connectors）→ 新增自訂連接器</li>'
+            f'<li>貼上 <code>{mcp_url}</code></li>'
+            '<li>授權時輸入信箱帳號＋密碼（建議使用應用程式專用密碼）</li></ol>'
+            '<p class="note">憑證只用來即時以 IMAP 驗證並加密封入你的存取權杖，伺服器不儲存；'
+            '撤銷方式：更改密碼或撤銷該應用程式專用密碼。</p>'
+            f'{self._footer()}</div>'
+        )
+        return self._document(body, "mcp-email MCP server")
 
     async def index_page(self, request: Request) -> Response:
         return self._page(self._index_html())
@@ -322,7 +358,8 @@ code{{background:#f1f5f9;border-radius:4px;padding:1px 5px;font-size:12px;word-b
         if txn not in self._pending:
             return self._page(self._login_html(
                 "", "此授權連結無效或已過期。若尚未連上，請回到用戶端重新連接。"), 400)
-        return self._page(self._login_html(txn))
+        name, host = self._client_display(self._pending[txn])
+        return self._page(self._login_html(txn, client_name=name, redirect_host=host))
 
     async def login_submit(self, request: Request) -> Response:
         form = await request.form()
@@ -339,13 +376,15 @@ code{{background:#f1f5f9;border-radius:4px;padding:1px 5px;font-size:12px;word-b
             return self._page(self._login_html(
                 "", "此授權階段已失效或已過期。若尚未連上，請回到用戶端重新連接一次。"), 400)
         client_id, params = entry["cid"], entry["params"]
+        name, host = self._client_display(entry)  # 重繪登入頁時保留同意橫幅
 
         # 失敗節流：上游可能封鎖「多次錯誤密碼」的來源 IP（即本 server 的 IP），
         # 達門檻就先在這裡擋下，不透傳給上游
         ip = self._client_ip(request)
         if self._throttled(ip):
             return self._page(self._login_html(
-                "", "驗證嘗試過於頻繁，請稍後再試。"), 429)
+                txn, "驗證嘗試過於頻繁，請稍後再試。",
+                client_name=name, redirect_host=host), 429)
 
         # 打一次 IMAP 登入驗證憑證（blocking → 丟 worker thread）
         try:
@@ -357,7 +396,9 @@ code{{background:#f1f5f9;border-radius:4px;padding:1px 5px;font-size:12px;word-b
                 del self._pending[txn]
                 return self._page(self._login_html(
                     "", "嘗試次數過多，此授權交易已作廢，請回到用戶端重新連接。"), 429)
-            return self._page(self._login_html(txn, "驗證失敗：帳號或密碼不正確。"), 401)
+            return self._page(self._login_html(
+                txn, "驗證失敗：帳號或密碼不正確。",
+                client_name=name, redirect_host=host), 401)
 
         del self._pending[txn]
         code = secrets.token_urlsafe(32)
