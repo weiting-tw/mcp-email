@@ -10,6 +10,7 @@
   🔍 連線測試：email_test_connection 一鍵測 SMTP + IMAP
   ⚡ 高效能：可調 timeout + 自動 retry（exponential backoff）
   📬 IMAP 讀信：list folders / list messages / get message / search / mark / delete
+  🔎 中文搜尋：search 含非 ASCII 關鍵字時自動用 CHARSET UTF-8 + literal
   🗂️ IMAP 整理：create folder（中文名 UTF-7）/ move messages（MOVE→COPY fallback）/ apply rules（dry_run）
 
 == 模式一：stdio（本機、單人，預設）==
@@ -603,15 +604,115 @@ def _imap_select(conn: imaplib.IMAP4, folder: str, readonly: bool = True) -> int
     return count
 
 
-def _imap_list_messages(folder: str, limit: int, search: str = "ALL") -> list[dict[str, Any]]:
+_SEARCH_TOKEN_RE = re.compile(r'"((?:\\.|[^"\\])*)"|(\S+)')
+
+# 後面接一個字串引數的 search key（非 ASCII 字串必須跟著這些 key 一起移動）
+_STRING_SEARCH_KEYS = {"SUBJECT", "FROM", "TO", "CC", "BCC", "BODY", "TEXT", "KEYWORD", "UNKEYWORD"}
+
+
+def _nonascii_search_plan(search: str) -> tuple[list[str], bytes]:
+    """把含非 ASCII（如中文）關鍵字的 IMAP search 拆成 (criteria tokens, literal)。
+
+    IMAP 對非 ASCII 搜尋字串要求 CHARSET + literal 傳輸，而 imaplib 的
+    literal 只能掛在整個指令的最尾端，所以：非 ASCII 字串必須是最後一個
+    token；若不是、但整個查詢是單純的 AND 序列（無 OR/NOT），就把它連同
+    所屬的 key（含 HEADER 的欄位名）搬到最後。無法安全重排時 raise ValueError。
+    一次只支援一個非 ASCII 關鍵字（imaplib 單 literal 限制）。
+    """
+    tokens: list[tuple[str, bool]] = []  # (值, 是否 quoted)
+    for m in _SEARCH_TOKEN_RE.finditer(search):
+        if m.group(1) is not None:
+            tokens.append((re.sub(r"\\(.)", r"\1", m.group(1)), True))
+        else:
+            tokens.append((m.group(2), False))
+    bad = [i for i, (v, _q) in enumerate(tokens) if not v.isascii()]
+    if len(bad) != 1:
+        raise ValueError(
+            "中文（非 ASCII）搜尋一次只支援一個關鍵字；多個條件請分次查詢縮小範圍，"
+            "或改用 email_apply_rules 的規則比對（客戶端比對，不受此限）"
+        )
+    i = bad[0]
+    start = i - 1
+    if start >= 1 and tokens[start - 1][0].upper() == "HEADER":
+        start = i - 2  # HEADER <欄位名> <值> 三個 token 一組
+    if start < 0 or tokens[start][1] or tokens[start][0].upper() not in (
+            _STRING_SEARCH_KEYS | {"HEADER"}):
+        raise ValueError(
+            f"無法解析中文關鍵字所屬的搜尋條件：{search!r}"
+            "（中文字串前面要有 SUBJECT / FROM / TEXT … 這類 key）"
+        )
+    if i != len(tokens) - 1:
+        # 需要重排 → 只有純 AND 序列才不會改變語意
+        uppers = {t[0].upper() for t in tokens[:start] + tokens[i + 1:] if not t[1]}
+        if "OR" in uppers or "NOT" in uppers:
+            raise ValueError("查詢含 OR / NOT 時，中文關鍵字必須放在最後一個條件")
+    pair = tokens[start:i + 1]
+    rest = tokens[:start] + tokens[i + 1:]
+    out = [('"%s"' % v.replace("\\", "\\\\").replace('"', '\\"')) if q else v
+           for v, q in rest]
+    out += [v for v, _q in pair[:-1]]  # key（與 HEADER 欄位名）都是 ASCII
+    return out, pair[-1][0].encode("utf-8")
+
+
+def _imap_search_ids(conn: imaplib.IMAP4, search: str) -> list[bytes]:
+    """執行 SEARCH 回傳 message id list；支援中文等非 ASCII 關鍵字。
+
+    純 ASCII 直接送（不帶 CHARSET，最相容）；含非 ASCII 時改用
+    SEARCH CHARSET UTF-8 + literal（RFC 3501 的標準做法）。
+    """
+    if search.isascii():
+        status, data = conn.search(None, search)
+    else:
+        criteria, literal = _nonascii_search_plan(search)
+        conn.literal = literal
+        status, data = conn.search("UTF-8", *criteria)
+    if status != "OK":
+        hint = "（伺服器可能不支援 CHARSET UTF-8 搜尋）" if not search.isascii() else ""
+        raise RuntimeError(f"search 失敗：{data!r}{hint}")
+    return data[0].split() if data and data[0] else []
+
+
+# 中文搜尋 fallback：可用客戶端 header 過濾代打的 search key → 對應回傳欄位
+_FALLBACK_FIELDS = {"SUBJECT": "subject", "FROM": "from", "TO": "to"}
+_FALLBACK_SCAN_MAX = 200  # 客戶端過濾最多掃描的 header 數（每封一次 fetch）
+
+
+def _client_filter_plan(search: str) -> Optional[tuple[str, str, str]]:
+    """中文搜尋的客戶端過濾方案：回 (server 端剩餘查詢, 過濾欄位, 中文詞)。
+    非 SUBJECT/FROM/TO 這類 header key（如 TEXT/BODY/HEADER）做不到 → None。"""
+    try:
+        criteria, literal = _nonascii_search_plan(search)
+    except ValueError:
+        return None
+    field = _FALLBACK_FIELDS.get(criteria[-1].upper())
+    if field is None:
+        return None
+    rest = " ".join(criteria[:-1]) or "ALL"
+    return rest, field, literal.decode("utf-8")
+
+
+def _imap_list_messages(folder: str, limit: int,
+                        search: str = "ALL") -> tuple[list[dict[str, Any]], Optional[str]]:
+    """回傳 (messages, note)。note 非 None 時代表走了中文搜尋的客戶端 fallback。"""
     with IMAPClient(_imap_cfg()) as conn:
         _imap_select(conn, folder, readonly=True)
-        status, data = conn.search(None, search)
-        if status != "OK":
-            raise RuntimeError(f"search 失敗：{data!r}")
-        ids = data[0].split() if data and data[0] else []
+        ids = _imap_search_ids(conn, search)
+        if not ids and not search.isascii():
+            # 部分伺服器（實測 Mail2000）接受 CHARSET UTF-8 語法但不比對
+            # RFC2047 編碼的中文 header → 改抓 header 回來在客戶端過濾
+            plan = _client_filter_plan(search)
+            if plan:
+                server_q, field, term = plan
+                scan = _imap_search_ids(conn, server_q)[-_FALLBACK_SCAN_MAX:]
+                headers = _fetch_headers(conn, reversed(scan))
+                matched = [h for h in headers
+                           if term.lower() in (h.get(field) or "").lower()]
+                note = (f"伺服器端中文搜尋無結果，已改用客戶端過濾："
+                        f"掃描「{server_q}」最近 {len(scan)} 封的 header，"
+                        f"比對 {field} 含「{term}」")
+                return (matched[:limit] if limit > 0 else matched), note
         ids = ids[-limit:] if limit > 0 else ids
-        return _fetch_headers(conn, reversed(ids))
+        return _fetch_headers(conn, reversed(ids)), None
 
 
 def _fetch_headers(conn: imaplib.IMAP4, mids) -> list[dict[str, Any]]:
@@ -889,7 +990,7 @@ def _imap_apply_rules(folder: str, limit: int, search: str,
                       rules: list[dict[str, Any]], dry_run: bool,
                       case_sensitive: bool = False,
                       match_mode: str = "first") -> dict[str, Any]:
-    msgs = _imap_list_messages(folder, limit, search)
+    msgs, _note = _imap_list_messages(folder, limit, search)
     hits: list[dict[str, Any]] = []          # 命中明細（給 dry_run / by_rule）
     per_uid: dict[str, list[dict[str, Any]]] = {}  # uid -> 命中的 rules（依序）
     for m in msgs:
@@ -1101,7 +1202,11 @@ async def list_tools() -> list[Tool]:
                     "search": {
                         "type": "string",
                         "default": "ALL",
-                        "description": "IMAP search 條件，如 UNSEEN / FROM \"xxx@y.com\" / SINCE 1-Jan-2026",
+                        "description": (
+                            "IMAP search 條件，如 UNSEEN / FROM \"xxx@y.com\" / SINCE 1-Jan-2026。"
+                            "支援中文關鍵字（自動改用 CHARSET UTF-8 literal），"
+                            "如 SUBJECT \"週報\"；一次一個中文詞，且建議放在最後一個條件"
+                        ),
                     },
                 },
             },
@@ -1366,8 +1471,11 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
         folder = args.get("folder", "INBOX")
         limit = int(args.get("limit", 20))
         search = args.get("search", "ALL")
-        messages = await asyncio.to_thread(_imap_list_messages, folder, limit, search)
-        return {"folder": folder, "count": len(messages), "messages": messages}
+        messages, note = await asyncio.to_thread(_imap_list_messages, folder, limit, search)
+        out = {"folder": folder, "count": len(messages), "messages": messages}
+        if note:
+            out["note"] = note
+        return out
 
     if name == "email_get_message":
         folder = args.get("folder", "INBOX")
