@@ -10,15 +10,37 @@
   🔍 連線測試：email_test_connection 一鍵測 SMTP + IMAP
   ⚡ 高效能：可調 timeout + 自動 retry（exponential backoff）
   📬 IMAP 讀信：list folders / list messages / get message / search / mark / delete
+  🔎 中文搜尋：search 含非 ASCII 關鍵字時自動用 CHARSET UTF-8 + literal
   🗂️ IMAP 整理：create folder（中文名 UTF-7）/ move messages（MOVE→COPY fallback）/ apply rules（dry_run）
 
+== 模式一：stdio（本機、單人，預設）==
 啟動：python -m mcp_email（或安裝後直接 `mcp-email`）
-協定：stdio (MCP standard)
+憑證走環境變數 /.env（或 runtime 用 email_configure），原有認證方式完全不變。
+
+== 模式二：streamable-http（Claude Code/Desktop 多人共用）==
+  python -m mcp_email --http --host 0.0.0.0 --port 8765
+憑證採 pass-through：伺服器**不保存任何帳密**，每個請求必須自帶
+  Authorization: Basic <base64(帳號:密碼)>
+標頭，伺服器原樣轉給 IMAP/SMTP 登入（主機/埠/TLS 仍由伺服器端環境變數設定）。
+HTTP 模式絕不回退到環境變數憑證。Basic 是明文等級，正式部署必須放在
+HTTPS 反向代理後面。
+
+Claude Code 用戶端設定：
+  claude mcp add --transport http email https://主機:8765/mcp \\
+    --header "Authorization: Basic $(printf '%s' '帳號:密碼' | base64)"
+
+== 模式三：OAuth bridge（claude.ai Connectors：手機 app / 網頁版）==
+  python -m mcp_email --oauth --issuer https://對外網址 --host 0.0.0.0 --port 8765
+標準 OAuth 2.1（動態註冊 + PKCE）。使用者第一次連接時會被導到 /login
+輸入信箱帳號＋密碼（建議用應用程式專用密碼），以 IMAP 登入驗證後，
+憑證以伺服器金鑰加密封進 token（無狀態，伺服器不存憑證）。
+細節見 mcp_email_oauth.py。issuer 必須是用戶端可達的 HTTPS 網址。
 
 依賴：
-  pip install "mcp[cli]>=0.9.0"
+  pip install "mcp[cli]>=1.0.0"
+  # OAuth 模式另需： pip install cryptography
 
-可選環境變數預設值（runtime 也能用 email_configure 覆蓋）：
+可選環境變數預設值（stdio 模式 runtime 也能用 email_configure 覆蓋）：
   SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_USE_TLS
   IMAP_HOST, IMAP_PORT, IMAP_USER, IMAP_PASS, IMAP_USE_SSL
   # 別名：HOST 可用 *_SERVER、USER 可用 *_USERNAME、PASS 可用 *_PASSWORD
@@ -29,12 +51,19 @@
   EMAIL_TIMEOUT_SEC    # 預設 30
   EMAIL_RETRY_MAX      # 預設 3
   EMAIL_ATTACHMENT_DIRS  # 附件路徑白名單，os.pathsep 分隔；設了才限制，否則不限
+
+遠端模式（--http / --oauth）另可設：
+  EMAIL_ALLOWED_HOSTS  # 反向代理後的對外網域白名單（逗號分隔），防 DNS-rebinding 421
+  EMAIL_BRIDGE_KEY / EMAIL_BRIDGE_KEY_FILE / EMAIL_OAUTH_CLIENTS /
+  EMAIL_AUTH_LOG / EMAIL_DOMAIN  # OAuth bridge 用，見 mcp_email_oauth.py
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import base64
+import dataclasses
 import email
 import email.message
 import email.policy
@@ -46,13 +75,15 @@ import re
 import smtplib
 import ssl
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from email.message import EmailMessage
-from email.utils import formataddr, getaddresses, parseaddr
+from email.utils import getaddresses
 from pathlib import Path
 from typing import Any, Optional
 
 from mcp.server import Server
+from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
@@ -62,6 +93,12 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 log = logging.getLogger("mcp-email")
+
+__version__ = "0.3.0"
+
+# 執行模式：stdio（預設，本機單人）/ http（Basic pass-through 多人共用）/
+# oauth（claude.ai Connectors）。由 cli() 依啟動參數設定。
+MODE: str = "stdio"
 
 
 # ─── 設定模型 ──────────────────────────────────────────────────────────────
@@ -117,6 +154,26 @@ def _parse_dir_list(raw: Optional[str]) -> list[str]:
         if part:
             out.append(str(Path(part).expanduser().resolve()))
     return out
+
+
+def _load_dotenv(path: Optional[str] = None) -> Optional[str]:
+    """讀取 .env（KEY=VALUE，每行一組），寫入 os.environ（不覆蓋既有值，環境變數優先）。
+    找尋順序：指定路徑 → 目前工作目錄 → 本程式所在目錄。回傳實際載入的路徑。"""
+    candidates: list[str] = [path] if path else []
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates += [os.path.join(os.getcwd(), ".env"), os.path.join(here, ".env")]
+    for p in candidates:
+        if not p or not os.path.isfile(p):
+            continue
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+        return p
+    return None
 
 
 def _env_any(*names: str, default: str = "") -> str:
@@ -178,7 +235,64 @@ def load_config_from_env() -> GlobalConfig:
 
 
 # ─── 全域可變 config（runtime 透過 tool 覆蓋）──────────────────────────────
+_load_dotenv()
 CONFIG: GlobalConfig = load_config_from_env()
+
+
+# ─── 每請求憑證（遠端模式 pass-through；stdio 恆為 None）───────────────────
+_REQ_CREDS: ContextVar[Optional[tuple[str, str]]] = ContextVar(
+    "mcp_email_req_creds", default=None,
+)
+
+
+def _parse_basic_auth(header: str) -> tuple[str, str]:
+    """解析 'Basic <base64(帳號:密碼)>' 標頭，供 --http 模式 pass-through 用。"""
+    if not header or not header.lower().startswith("basic "):
+        raise PermissionError("需要 Authorization: Basic <base64(帳號:密碼)> 標頭")
+    try:
+        user, sep, pwd = base64.b64decode(header[6:].strip()).decode("utf-8").partition(":")
+    except Exception as exc:
+        raise PermissionError(f"Authorization 標頭不是合法的 Base64：{exc}") from exc
+    if not sep or not user or not pwd:
+        raise PermissionError("Authorization 標頭內容需為 帳號:密碼")
+    return user, pwd
+
+
+def _request_creds() -> Optional[tuple[str, str]]:
+    """取本次工具呼叫的信箱憑證，依模式：
+    oauth → Bearer token 解密出的使用者憑證（get_access_token）。
+    http  → 該請求的 Authorization: Basic 標頭，絕不回退到環境變數，
+            避免多人共用時冒用部署者身分。
+    stdio → None（沿用環境變數 / email_configure 的原有認證方式）。"""
+    if MODE == "stdio":
+        return None
+    tok = get_access_token()
+    if tok is not None and getattr(tok, "email_user", ""):
+        return tok.email_user, tok.email_pass
+    try:
+        req = server.request_context.request
+    except LookupError:
+        req = None
+    if req is None:
+        raise PermissionError("遠端模式取不到 HTTP 請求內容，無法驗證身分")
+    return _parse_basic_auth(req.headers.get("authorization", ""))
+
+
+def _smtp_cfg() -> SMTPConfig:
+    """本次呼叫實際生效的 SMTP 設定：遠端模式以每請求憑證覆蓋帳密，
+    主機/埠/TLS 仍由伺服器端設定；stdio 模式原樣回傳 CONFIG.smtp。"""
+    creds = _REQ_CREDS.get()
+    if creds is None:
+        return CONFIG.smtp
+    return dataclasses.replace(CONFIG.smtp, username=creds[0], password=creds[1])
+
+
+def _imap_cfg() -> IMAPConfig:
+    """本次呼叫實際生效的 IMAP 設定（規則同 _smtp_cfg）。"""
+    creds = _REQ_CREDS.get()
+    if creds is None:
+        return CONFIG.imap
+    return dataclasses.replace(CONFIG.imap, username=creds[0], password=creds[1])
 
 
 # ─── SMTP 工具 ─────────────────────────────────────────────────────────────
@@ -234,6 +348,12 @@ def _resolve_attachment_path(path: str) -> Path:
     """
     p = Path(path).expanduser().resolve()
     allowed = CONFIG.attachment_allowed_dirs
+    if MODE != "stdio" and not allowed:
+        # 遠端多人共用時 path 讀的是「伺服器」檔案系統，等於任意檔案外洩管道
+        raise PermissionError(
+            "遠端（--http/--oauth）模式停用本機路徑附件；"
+            "請改用 content_base64，或由管理員以 EMAIL_ATTACHMENT_DIRS 白名單開放"
+        )
     if allowed:
         ok = False
         for base in allowed:
@@ -484,51 +604,155 @@ def _imap_select(conn: imaplib.IMAP4, folder: str, readonly: bool = True) -> int
     return count
 
 
-def _imap_list_messages(folder: str, limit: int, search: str = "ALL") -> list[dict[str, Any]]:
-    with IMAPClient(CONFIG.imap) as conn:
-        _imap_select(conn, folder, readonly=True)
+_SEARCH_TOKEN_RE = re.compile(r'"((?:\\.|[^"\\])*)"|(\S+)')
+
+# 後面接一個字串引數的 search key（非 ASCII 字串必須跟著這些 key 一起移動）
+_STRING_SEARCH_KEYS = {"SUBJECT", "FROM", "TO", "CC", "BCC", "BODY", "TEXT", "KEYWORD", "UNKEYWORD"}
+
+
+def _nonascii_search_plan(search: str) -> tuple[list[str], bytes]:
+    """把含非 ASCII（如中文）關鍵字的 IMAP search 拆成 (criteria tokens, literal)。
+
+    IMAP 對非 ASCII 搜尋字串要求 CHARSET + literal 傳輸，而 imaplib 的
+    literal 只能掛在整個指令的最尾端，所以：非 ASCII 字串必須是最後一個
+    token；若不是、但整個查詢是單純的 AND 序列（無 OR/NOT），就把它連同
+    所屬的 key（含 HEADER 的欄位名）搬到最後。無法安全重排時 raise ValueError。
+    一次只支援一個非 ASCII 關鍵字（imaplib 單 literal 限制）。
+    """
+    tokens: list[tuple[str, bool]] = []  # (值, 是否 quoted)
+    for m in _SEARCH_TOKEN_RE.finditer(search):
+        if m.group(1) is not None:
+            tokens.append((re.sub(r"\\(.)", r"\1", m.group(1)), True))
+        else:
+            tokens.append((m.group(2), False))
+    bad = [i for i, (v, _q) in enumerate(tokens) if not v.isascii()]
+    if len(bad) != 1:
+        raise ValueError(
+            "中文（非 ASCII）搜尋一次只支援一個關鍵字；多個條件請分次查詢縮小範圍，"
+            "或改用 email_apply_rules 的規則比對（客戶端比對，不受此限）"
+        )
+    i = bad[0]
+    start = i - 1
+    if start >= 1 and tokens[start - 1][0].upper() == "HEADER":
+        start = i - 2  # HEADER <欄位名> <值> 三個 token 一組
+    if start < 0 or tokens[start][1] or tokens[start][0].upper() not in (
+            _STRING_SEARCH_KEYS | {"HEADER"}):
+        raise ValueError(
+            f"無法解析中文關鍵字所屬的搜尋條件：{search!r}"
+            "（中文字串前面要有 SUBJECT / FROM / TEXT … 這類 key）"
+        )
+    if i != len(tokens) - 1:
+        # 需要重排 → 只有純 AND 序列才不會改變語意
+        uppers = {t[0].upper() for t in tokens[:start] + tokens[i + 1:] if not t[1]}
+        if "OR" in uppers or "NOT" in uppers:
+            raise ValueError("查詢含 OR / NOT 時，中文關鍵字必須放在最後一個條件")
+    pair = tokens[start:i + 1]
+    rest = tokens[:start] + tokens[i + 1:]
+    out = [('"%s"' % v.replace("\\", "\\\\").replace('"', '\\"')) if q else v
+           for v, q in rest]
+    out += [v for v, _q in pair[:-1]]  # key（與 HEADER 欄位名）都是 ASCII
+    return out, pair[-1][0].encode("utf-8")
+
+
+def _imap_search_ids(conn: imaplib.IMAP4, search: str) -> list[bytes]:
+    """執行 SEARCH 回傳 message id list；支援中文等非 ASCII 關鍵字。
+
+    純 ASCII 直接送（不帶 CHARSET，最相容）；含非 ASCII 時改用
+    SEARCH CHARSET UTF-8 + literal（RFC 3501 的標準做法）。
+    """
+    if search.isascii():
         status, data = conn.search(None, search)
-        if status != "OK":
-            raise RuntimeError(f"search 失敗：{data!r}")
-        ids = data[0].split() if data and data[0] else []
+    else:
+        criteria, literal = _nonascii_search_plan(search)
+        conn.literal = literal
+        status, data = conn.search("UTF-8", *criteria)
+    if status != "OK":
+        hint = "（伺服器可能不支援 CHARSET UTF-8 搜尋）" if not search.isascii() else ""
+        raise RuntimeError(f"search 失敗：{data!r}{hint}")
+    return data[0].split() if data and data[0] else []
+
+
+# 中文搜尋 fallback：可用客戶端 header 過濾代打的 search key → 對應回傳欄位
+_FALLBACK_FIELDS = {"SUBJECT": "subject", "FROM": "from", "TO": "to"}
+_FALLBACK_SCAN_MAX = 200  # 客戶端過濾最多掃描的 header 數（每封一次 fetch）
+
+
+def _client_filter_plan(search: str) -> Optional[tuple[str, str, str]]:
+    """中文搜尋的客戶端過濾方案：回 (server 端剩餘查詢, 過濾欄位, 中文詞)。
+    非 SUBJECT/FROM/TO 這類 header key（如 TEXT/BODY/HEADER）做不到 → None。"""
+    try:
+        criteria, literal = _nonascii_search_plan(search)
+    except ValueError:
+        return None
+    field = _FALLBACK_FIELDS.get(criteria[-1].upper())
+    if field is None:
+        return None
+    rest = " ".join(criteria[:-1]) or "ALL"
+    return rest, field, literal.decode("utf-8")
+
+
+def _imap_list_messages(folder: str, limit: int,
+                        search: str = "ALL") -> tuple[list[dict[str, Any]], Optional[str]]:
+    """回傳 (messages, note)。note 非 None 時代表走了中文搜尋的客戶端 fallback。"""
+    with IMAPClient(_imap_cfg()) as conn:
+        _imap_select(conn, folder, readonly=True)
+        ids = _imap_search_ids(conn, search)
+        if not ids and not search.isascii():
+            # 部分伺服器（實測 Mail2000）接受 CHARSET UTF-8 語法但不比對
+            # RFC2047 編碼的中文 header → 改抓 header 回來在客戶端過濾
+            plan = _client_filter_plan(search)
+            if plan:
+                server_q, field, term = plan
+                scan = _imap_search_ids(conn, server_q)[-_FALLBACK_SCAN_MAX:]
+                headers = _fetch_headers(conn, reversed(scan))
+                matched = [h for h in headers
+                           if term.lower() in (h.get(field) or "").lower()]
+                note = (f"伺服器端中文搜尋無結果，已改用客戶端過濾："
+                        f"掃描「{server_q}」最近 {len(scan)} 封的 header，"
+                        f"比對 {field} 含「{term}」")
+                return (matched[:limit] if limit > 0 else matched), note
         ids = ids[-limit:] if limit > 0 else ids
-        results: list[dict[str, Any]] = []
-        for mid in reversed(ids):
-            status, fetched = conn.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)] FLAGS UID)")
-            if status != "OK" or not fetched:
-                continue
-            # 從整個 fetch 回應彙整 metadata：UID / FLAGS 可能出現在 BODY literal「之後」的
-            # 獨立 bytes 元素裡（server 排序自由），所以把所有非 literal 片段都納入比對。
-            header_blob = b""
-            meta_parts: list[str] = []
-            for piece in fetched:
-                if isinstance(piece, tuple):
-                    # (含 literal 標記的回應字串, literal 資料)
-                    header_blob = piece[1] or header_blob
-                    if piece[0]:
-                        meta_parts.append(piece[0].decode("utf-8", errors="replace"))
-                elif isinstance(piece, (bytes, bytearray)):
-                    meta_parts.append(bytes(piece).decode("utf-8", errors="replace"))
-            meta = " ".join(meta_parts)
-            m = re.search(r"\bUID\s+(\d+)", meta)
-            uid_val: Optional[str] = m.group(1) if m else None
-            m = re.search(r"\bFLAGS\s+\(([^)]*)\)", meta)
-            flags_str = m.group(1).strip() if m else ""
-            msg = email.message_from_bytes(header_blob)
-            results.append({
-                "imap_id": mid.decode(),
-                "uid": uid_val,
-                "from": _decode_header(msg.get("From", "")),
-                "to": _decode_header(msg.get("To", "")),
-                "subject": _decode_header(msg.get("Subject", "")),
-                "date": msg.get("Date", ""),
-                "flags": flags_str,
-            })
-        return results
+        return _fetch_headers(conn, reversed(ids)), None
+
+
+def _fetch_headers(conn: imaplib.IMAP4, mids) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for mid in mids:
+        status, fetched = conn.fetch(mid, "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)] FLAGS UID)")
+        if status != "OK" or not fetched:
+            continue
+        # 從整個 fetch 回應彙整 metadata：UID / FLAGS 可能出現在 BODY literal「之後」的
+        # 獨立 bytes 元素裡（server 排序自由），所以把所有非 literal 片段都納入比對。
+        header_blob = b""
+        meta_parts: list[str] = []
+        for piece in fetched:
+            if isinstance(piece, tuple):
+                # (含 literal 標記的回應字串, literal 資料)
+                header_blob = piece[1] or header_blob
+                if piece[0]:
+                    meta_parts.append(piece[0].decode("utf-8", errors="replace"))
+            elif isinstance(piece, (bytes, bytearray)):
+                meta_parts.append(bytes(piece).decode("utf-8", errors="replace"))
+        meta = " ".join(meta_parts)
+        m = re.search(r"\bUID\s+(\d+)", meta)
+        uid_val: Optional[str] = m.group(1) if m else None
+        m = re.search(r"\bFLAGS\s+\(([^)]*)\)", meta)
+        flags_str = m.group(1).strip() if m else ""
+        msg = email.message_from_bytes(header_blob)
+        results.append({
+            "imap_id": mid.decode(),
+            "uid": uid_val,
+            "from": _decode_header(msg.get("From", "")),
+            "to": _decode_header(msg.get("To", "")),
+            "subject": _decode_header(msg.get("Subject", "")),
+            "date": msg.get("Date", ""),
+            "flags": flags_str,
+        })
+    return results
 
 
 def _imap_get_message(folder: str, uid: str, peek: bool = True) -> dict[str, Any]:
-    with IMAPClient(CONFIG.imap) as conn:
+    with IMAPClient(_imap_cfg()) as conn:
         _imap_select(conn, folder, readonly=peek)
         section = "BODY.PEEK[]" if peek else "BODY[]"
         status, data = conn.uid("fetch", uid, f"({section})")
@@ -574,7 +798,7 @@ def _imap_get_message(folder: str, uid: str, peek: bool = True) -> dict[str, Any
 
 
 def _imap_list_folders() -> list[str]:
-    with IMAPClient(CONFIG.imap) as conn:
+    with IMAPClient(_imap_cfg()) as conn:
         status, folders = conn.list()
         if status != "OK":
             raise RuntimeError(f"list folders 失敗：{folders!r}")
@@ -591,7 +815,7 @@ def _imap_list_folders() -> list[str]:
 
 
 def _imap_mark(folder: str, uids: list[str], flag: str, add: bool) -> dict[str, Any]:
-    with IMAPClient(CONFIG.imap) as conn:
+    with IMAPClient(_imap_cfg()) as conn:
         _imap_select(conn, folder, readonly=False)
         action = "+FLAGS.SILENT" if add else "-FLAGS.SILENT"
         ok = 0
@@ -606,7 +830,7 @@ def _imap_mark(folder: str, uids: list[str], flag: str, add: bool) -> dict[str, 
 
 
 def _imap_delete(folder: str, uids: list[str]) -> dict[str, Any]:
-    with IMAPClient(CONFIG.imap) as conn:
+    with IMAPClient(_imap_cfg()) as conn:
         _imap_select(conn, folder, readonly=False)
         ok = 0
         fail = []
@@ -655,7 +879,7 @@ def _imap_folder_exists(conn: imaplib.IMAP4, folder: str) -> bool:
 
 
 def _imap_create_folder(folder: str) -> dict[str, Any]:
-    with IMAPClient(CONFIG.imap) as conn:
+    with IMAPClient(_imap_cfg()) as conn:
         mbox = _imap_mailbox(folder)
         if _imap_folder_exists(conn, folder):
             return {"folder": folder, "created": False, "already_exists": True}
@@ -674,7 +898,7 @@ def _imap_create_folder(folder: str) -> dict[str, Any]:
 
 
 def _imap_move_messages(source: str, uids: list[str], dest: str) -> dict[str, Any]:
-    with IMAPClient(CONFIG.imap) as conn:
+    with IMAPClient(_imap_cfg()) as conn:
         # 目的地必須先存在（不自動建立，請先呼叫 email_create_folder）
         if not _imap_folder_exists(conn, dest):
             raise RuntimeError(f"目的地資料夾不存在：{dest}（請先呼叫 email_create_folder）")
@@ -766,7 +990,7 @@ def _imap_apply_rules(folder: str, limit: int, search: str,
                       rules: list[dict[str, Any]], dry_run: bool,
                       case_sensitive: bool = False,
                       match_mode: str = "first") -> dict[str, Any]:
-    msgs = _imap_list_messages(folder, limit, search)
+    msgs, _note = _imap_list_messages(folder, limit, search)
     hits: list[dict[str, Any]] = []          # 命中明細（給 dry_run / by_rule）
     per_uid: dict[str, list[dict[str, Any]]] = {}  # uid -> 命中的 rules（依序）
     for m in msgs:
@@ -822,7 +1046,7 @@ def _imap_apply_rules(folder: str, limit: int, search: str,
         executed["moved"] += r["moved"]
         executed["failed"] += r["failed"]
     if marks:
-        with IMAPClient(CONFIG.imap) as conn:
+        with IMAPClient(_imap_cfg()) as conn:
             _imap_select(conn, folder, readonly=False)
             for uid, flag, add in marks:
                 action = "+FLAGS.SILENT" if add else "-FLAGS.SILENT"
@@ -841,12 +1065,12 @@ def _imap_apply_rules(folder: str, limit: int, search: str,
 
 
 # ─── MCP server ───────────────────────────────────────────────────────────
-server = Server("mcp-email")
+server = Server("mcp-email", version=__version__)
 
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    tools = [
         Tool(
             name="email_configure",
             description=(
@@ -978,7 +1202,11 @@ async def list_tools() -> list[Tool]:
                     "search": {
                         "type": "string",
                         "default": "ALL",
-                        "description": "IMAP search 條件，如 UNSEEN / FROM \"xxx@y.com\" / SINCE 1-Jan-2026",
+                        "description": (
+                            "IMAP search 條件，如 UNSEEN / FROM \"xxx@y.com\" / SINCE 1-Jan-2026。"
+                            "支援中文關鍵字（自動改用 CHARSET UTF-8 literal），"
+                            "如 SUBJECT \"週報\"；一次一個中文詞，且建議放在最後一個條件"
+                        ),
                     },
                 },
             },
@@ -1112,12 +1340,19 @@ async def list_tools() -> list[Tool]:
             },
         ),
     ]
+    if MODE != "stdio":
+        # 遠端多人共用：全域設定不容任一使用者改動，直接不列出
+        tools = [t for t in tools if t.name != "email_configure"]
+    return tools
 
 
 # ─── tool 實作 dispatch ───────────────────────────────────────────────────
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     try:
+        # 遠端模式：先解析本次請求的憑證（Basic 標頭 / OAuth token），
+        # 之後 _smtp_cfg()/_imap_cfg()（含 to_thread 內）都以它覆蓋帳密
+        _REQ_CREDS.set(_request_creds())
         result = await _dispatch(name, arguments or {})
     except Exception as exc:
         log.exception("tool %s 執行失敗", name)
@@ -1132,6 +1367,11 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
     global CONFIG
 
     if name == "email_configure":
+        if MODE != "stdio":
+            raise PermissionError(
+                "遠端（--http/--oauth）模式為多人共用，email_configure 已停用；"
+                "伺服器端設定請用環境變數，帳密由每請求認證帶入"
+            )
         if "smtp" in args:
             for k, v in (args["smtp"] or {}).items():
                 if hasattr(CONFIG.smtp, k):
@@ -1157,7 +1397,7 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
         if do_smtp:
             try:
                 def _test_smtp():
-                    with _build_smtp_client(CONFIG.smtp) as client:
+                    with _build_smtp_client(_smtp_cfg()) as client:
                         client.noop()
                 await asyncio.to_thread(_test_smtp)
                 out["smtp"] = {"ok": True, "host": CONFIG.smtp.host, "port": CONFIG.smtp.port}
@@ -1166,7 +1406,7 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
         if do_imap:
             try:
                 def _test_imap():
-                    with IMAPClient(CONFIG.imap) as conn:
+                    with IMAPClient(_imap_cfg()) as conn:
                         conn.noop()
                 await asyncio.to_thread(_test_imap)
                 out["imap"] = {"ok": True, "host": CONFIG.imap.host, "port": CONFIG.imap.port}
@@ -1175,7 +1415,16 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
         return out
 
     if name == "email_send":
-        sender = args.get("from") or CONFIG.email_from or CONFIG.smtp.username
+        smtp_cfg = _smtp_cfg()
+        creds = _REQ_CREDS.get()
+        if MODE != "stdio" and creds is None:
+            # 防禦性：正常流程 call_tool 已先解析憑證；這裡再擋一層，
+            # 確保遠端模式永遠不會落回部署者（環境變數）的寄件身分
+            raise PermissionError("遠端模式缺少本次請求的憑證，拒絕以伺服器身分寄信")
+        # 遠端模式預設 From = 該請求登入的帳號（EMAIL_FROM 是伺服器端全域值，不適用多人）
+        sender = args.get("from") or (
+            creds[0] if creds else (CONFIG.email_from or smtp_cfg.username)
+        )
         if not sender:
             raise RuntimeError("找不到寄件人：請設定 EMAIL_FROM 或 email_configure({email_from:...})")
         to = _parse_addresses(args.get("to"))
@@ -1199,7 +1448,7 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
 
         started = time.time()
         result = await _retry(
-            lambda: _send_via_smtp(CONFIG.smtp, msg, recipients),
+            lambda: _send_via_smtp(smtp_cfg, msg, recipients),
             max_retries=CONFIG.retry_max,
             base_delay=CONFIG.retry_base_delay,
             what="SMTP send",
@@ -1222,8 +1471,11 @@ async def _dispatch(name: str, args: dict[str, Any]) -> Any:
         folder = args.get("folder", "INBOX")
         limit = int(args.get("limit", 20))
         search = args.get("search", "ALL")
-        messages = await asyncio.to_thread(_imap_list_messages, folder, limit, search)
-        return {"folder": folder, "count": len(messages), "messages": messages}
+        messages, note = await asyncio.to_thread(_imap_list_messages, folder, limit, search)
+        out = {"folder": folder, "count": len(messages), "messages": messages}
+        if note:
+            out["note"] = note
+        return out
 
     if name == "email_get_message":
         folder = args.get("folder", "INBOX")
@@ -1308,9 +1560,118 @@ async def main() -> None:
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
+def _transport_security(issuer: Optional[str], port: int):
+    """SDK 的 DNS-rebinding 防護預設只放行 localhost 的 Host 標頭——
+    部署在反向代理後（Host=對外網域）會把已授權請求全擋成
+    421 Invalid Host header。這裡把 issuer 網域（OAuth 模式）與
+    EMAIL_ALLOWED_HOSTS 環境變數（HTTP 模式）加入白名單；
+    兩者皆未提供時回 None＝維持 SDK 預設（純本機情境）。"""
+    from urllib.parse import urlparse
+
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    hosts = [h.strip() for h in os.environ.get("EMAIL_ALLOWED_HOSTS", "").split(",")
+             if h.strip()]
+    origins: list[str] = []
+    if issuer:
+        p = urlparse(issuer)
+        if p.hostname:
+            hosts += [p.netloc, p.hostname]
+            origins += [f"{p.scheme}://{p.netloc}"]
+    if not hosts:
+        return None
+    hosts += ["localhost", "127.0.0.1", f"localhost:{port}", f"127.0.0.1:{port}"]
+    origins += [f"http://localhost:{port}", f"http://127.0.0.1:{port}"]
+    return TransportSecuritySettings(allowed_hosts=hosts, allowed_origins=origins)
+
+
+def build_remote_server(host: str, port: int, oauth: bool = False,
+                        issuer: Optional[str] = None):
+    """建立 --http / --oauth 模式的服務。
+
+    只借 FastMCP 的 HTTP 佈線與 OAuth 端點；tools 直接把 stdio 用的低階
+    handler（list_tools / call_tool）掛到 FastMCP 內部的低階 Server 上，
+    schema 與實作兩種模式永遠同一份。"""
+    from mcp.server.fastmcp import FastMCP
+
+    security = _transport_security(issuer, port)
+    if oauth:
+        import mcp_email_oauth
+        provider, auth_settings = mcp_email_oauth.create(issuer)
+        fm = FastMCP("mcp-email", auth_server_provider=provider, auth=auth_settings,
+                     transport_security=security)
+        mcp_email_oauth.add_login_routes(fm, provider)
+    else:
+        fm = FastMCP("mcp-email", transport_security=security)
+    fm._mcp_server.version = __version__
+    fm._mcp_server.list_tools()(list_tools)
+    fm._mcp_server.call_tool()(call_tool)
+    fm.settings.host = host
+    fm.settings.port = port
+    return fm
+
+
+class _NoBufferMiddleware:
+    """回應加 X-Accel-Buffering: no——nginx 系反向代理（Synology、NPM…）
+    看到會對該回應停用緩衝，SSE 事件才會即時送達；代理端不用改設定。"""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        async def send2(msg):
+            if msg["type"] == "http.response.start":
+                msg.setdefault("headers", []).append((b"x-accel-buffering", b"no"))
+            await send(msg)
+
+        return await self.app(scope, receive, send2)
+
+
+def _run_http(fm) -> None:
+    import uvicorn
+    log.info("mcp-email server starting (%s) — http://%s:%d/mcp",
+             MODE, fm.settings.host, fm.settings.port)
+    # timeout_graceful_shutdown：SSE 長連線不會自己斷，收到 SIGTERM 後
+    # 最多等 3 秒就強制關閉，容器 stop/重啟才不會卡住
+    uvicorn.run(_NoBufferMiddleware(fm.streamable_http_app()),
+                host=fm.settings.host, port=fm.settings.port,
+                timeout_graceful_shutdown=3)
+
+
 def cli() -> None:
     """console_scripts / `python -m mcp_email` 的同步進入點。"""
-    asyncio.run(main())
+    global MODE
+    ap = argparse.ArgumentParser(description="IMAP/SMTP 信箱 MCP server")
+    ap.add_argument("--http", action="store_true",
+                    help="streamable-http 模式（憑證走每請求 Authorization: Basic 標頭）")
+    ap.add_argument("--oauth", action="store_true",
+                    help="streamable-http + OAuth bridge 模式（claude.ai Connectors 用）")
+    ap.add_argument("--issuer",
+                    help="OAuth 模式必填：用戶端可達的對外網址（如 https://host:8765）")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="HTTP/OAuth 模式綁定位址（預設 127.0.0.1）")
+    ap.add_argument("--port", type=int, default=8765,
+                    help="HTTP/OAuth 模式埠號（預設 8765）")
+    args = ap.parse_args()
+    if args.oauth:
+        if not args.issuer:
+            ap.error("--oauth 需要 --issuer（用戶端可達的對外網址）")
+        if not CONFIG.imap.host:
+            ap.error("--oauth 需要伺服器端 IMAP 設定（IMAP_HOST 等），登入頁靠它驗證帳密")
+        MODE = "oauth"
+        _run_http(build_remote_server(args.host, args.port, oauth=True, issuer=args.issuer))
+    elif args.http:
+        MODE = "http"
+        if not CONFIG.imap.host and not CONFIG.smtp.host:
+            log.warning("尚未設定 IMAP_HOST / SMTP_HOST：--http 模式帳密走 pass-through，"
+                        "但主機/埠/TLS 仍需伺服器端環境變數")
+        _run_http(build_remote_server(args.host, args.port))
+    else:
+        # 原有的本機 stdio 模式：認證方式（環境變數 /.env / email_configure）不變
+        asyncio.run(main())
 
 
 if __name__ == "__main__":

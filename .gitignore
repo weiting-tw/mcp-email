@@ -19,3 +19,8 @@ env/
 # 本機設定（含密碼，切勿提交）
 claude_desktop_config.json
 .env
+
+# OAuth bridge 執行期檔案（金鑰 / client 註冊 / 登入失敗日誌，切勿提交）
+.bridge-key
+.oauth-clients.json
+auth.log*

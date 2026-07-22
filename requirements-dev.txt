@@ -1,3 +1,5 @@
 # 開發 / 測試用依賴（執行時不需要）
 -r requirements.txt
-aiosmtpd>=1.4    # test_e2e.py 用的 in-process 假 SMTP server
+aiosmtpd>=1.4      # test_e2e.py 用的 in-process 假 SMTP server
+cryptography>=42   # test_remote.py 的 OAuth bridge 測試
+pytest>=8          # test_remote.py 用 pytest 執行

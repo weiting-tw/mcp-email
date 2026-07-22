@@ -1,1 +1,3 @@
-mcp[cli]>=1.0.0
+mcp[cli]>=1.28
+# --oauth 模式（claude.ai Connectors）另需：
+# cryptography>=42

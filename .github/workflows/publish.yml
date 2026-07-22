@@ -1,0 +1,44 @@
+# 推 v* tag 就自動 build + 發佈到 PyPI（Trusted Publishing / OIDC，不需要 API token）。
+#
+# 一次性設定（PyPI 網站）：
+#   專案 mcp-email → Settings → Publishing → Add a new publisher（GitHub）
+#   owner: weiting-tw / repository: mcp-email / workflow: publish.yml / environment: pypi
+#
+# 之後每次發佈：
+#   1. bump pyproject.toml 的 version（如 0.3.0）並 commit
+#   2. git tag v0.3.0 && git push origin v0.3.0
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write   # PyPI Trusted Publishing（OIDC）
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
